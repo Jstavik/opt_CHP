@@ -4,14 +4,12 @@ import pulp
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
-import datetime
 
 # ======================================================
-# 1) KONFIGURACE STRÁNKY A STYLU
+# 1) KONFIGURACE STRÁNKY
 # ======================================================
 st.set_page_config(page_title="KGJ Strategy Expert", layout="wide")
 
-# Inicializace session_state, aby data zůstala v paměti při změně parametrů
 if 'fwd_ee' not in st.session_state: st.session_state.fwd_ee = None
 if 'loc_data' not in st.session_state: st.session_state.loc_data = None
 
@@ -22,37 +20,41 @@ st.title("🎯 Strategický Optimalizátor KGJ")
 # ======================================================
 st.sidebar.header("📈 Tržní FWD Křivky")
 
-# Upload Master EE souboru (pro X let)
-fwd_file = st.sidebar.file_uploader("1. Nahraj Master EE FWD (např. 2026-2035)", type=["xlsx"])
+fwd_file = st.sidebar.file_uploader("1. Nahraj Master EE FWD", type=["xlsx"])
 if fwd_file:
-    st.session_state.fwd_ee = pd.read_excel(fwd_file)
-    st.session_state.fwd_ee['datetime'] = pd.to_datetime(st.session_state.fwd_ee['datetime'])
+    data = pd.read_excel(fwd_file)
+    # OPRAVA: Sjednocení názvů sloupců (odstranění mezer a malá písmena)
+    data.columns = [str(c).strip().lower() for c in data.columns]
+    
+    if 'datetime' in data.columns:
+        data['datetime'] = pd.to_datetime(data['datetime'])
+        st.session_state.fwd_ee = data
+        st.sidebar.success("Master EE nahrán v pořádku.")
+    else:
+        st.sidebar.error("Chyba: Soubor musí obsahovat sloupec 'datetime'!")
 
 if st.session_state.fwd_ee is not None:
-    years = st.session_state.fwd_ee['datetime'].dt.year.unique()
-    sel_year = st.sidebar.selectbox("Vyber rok pro analýzu", sorted(years))
+    years = sorted(st.session_state.fwd_ee['datetime'].dt.year.unique())
+    sel_year = st.sidebar.selectbox("Vyber rok pro analýzu", years)
     
-    # Filtrace a úprava EE Base
     df_yr = st.session_state.fwd_ee[st.session_state.fwd_ee['datetime'].dt.year == sel_year].copy().reset_index(drop=True)
-    raw_ee_base = df_yr['ee_price'].mean()
-    st.sidebar.write(f"Průměrná EE cena v souboru: **{raw_ee_base:.2f} EUR**")
     
-    ee_shift = st.sidebar.number_input("Posun EE Base [EUR/MWh]", value=0.0, step=1.0)
-    df_yr['ee_price'] = df_yr['ee_price'] + ee_shift
-    
-    # Zadávání plynu po měsících (dle tvého obrázku)
+    # Ošetření sloupce ee_price
+    if 'ee_price' not in df_yr.columns:
+        st.sidebar.error("Chyba: V souboru chybí sloupec 'ee_price'!")
+    else:
+        raw_ee_base = df_yr['ee_price'].mean()
+        st.sidebar.write(f"Původní Base {sel_year}: **{raw_ee_base:.2f} EUR**")
+        ee_shift = st.sidebar.number_input("Posun EE Base [EUR/MWh]", value=0.0)
+        df_yr['ee_price'] += ee_shift
+
+    # Plyn po měsících
     st.sidebar.subheader(f"Ceny plynu pro rok {sel_year}")
     gas_months = []
-    # Přednastavené hodnoty pro ilustraci (možno přepsat)
     default_gas = [35.0, 34.5, 34.0, 31.0, 30.0, 30.0, 30.0, 30.0, 30.0, 32.0, 34.0, 35.0]
-    
-    cols = st.sidebar.columns(2)
     for m in range(1, 13):
-        with cols[(m-1)%2]:
-            g_val = st.number_input(f"Měsíc {m}", value=default_gas[m-1], key=f"gas_{sel_year}_{m}")
-            gas_months.append(g_val)
-    
-    # Rozprostření měsíčního plynu do hodin v roce
+        g_val = st.sidebar.number_input(f"Měsíc {m}", value=default_gas[m-1], key=f"g_{m}")
+        gas_months.append(g_val)
     df_yr['gas_price'] = df_yr['datetime'].dt.month.map(lambda x: gas_months[x-1])
 
 # ======================================================
@@ -204,3 +206,4 @@ if st.session_state.fwd_ee is not None and st.session_state.loc_data is not None
 
 else:
     st.warning("Nahraj oba soubory (Master EE vlevo a Profil poptávky zde) pro spuštění.")
+

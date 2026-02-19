@@ -74,49 +74,67 @@ if loc_file:
 
 # --- 3. SEKCE: OPTIMALIZACE ---
 if st.session_state.fwd_data is not None and st.session_state.loc_data is not None:
-    calc_df = pd.merge(df_yr, st.session_state.loc_data[['mdh', 'heat_price', 'heat_demand']], on='mdh', how='inner')
-    calc_df = calc_df.sort_values('datetime').reset_index(drop=True)
+    
+    # POISTKA: Vytvoříme mdh klíče znovu přímo zde, aby merge neházel KeyError
+    df_yr['mdh'] = df_yr['datetime'].dt.strftime('%m-%d-%H')
+    
+    # Vytvoříme pomocnou tabulku lokality jen s potřebnými sloupci
+    loc_tmp = st.session_state.loc_data.copy()
+    loc_tmp['mdh'] = loc_tmp['datetime'].dt.strftime('%m-%d-%H')
+    
+    # Vybereme jen sloupce, které chceme spojit (vyhneme se duplicitnímu 'datetime')
+    loc_to_merge = loc_tmp[['mdh', 'heat_price', 'heat_demand']]
 
-    with st.expander("🛠️ Technické parametry KGJ", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            k_th = st.number_input("Tepelný výkon [MW]", value=1.09)
-            k_el = st.number_input("Elektrický výkon [MW]", value=0.999)
-        with c2:
-            k_eff = st.number_input("Tepelná účinnost", value=0.46)
-            k_serv = st.number_input("Servis [EUR/hod]", value=12.0)
-        with c3:
-            dist_ee = st.number_input("Distribuce nákup [EUR]", value=33.0)
-            b_eff = st.number_input("Účinnost kotle", value=0.95)
+    # Samotné spojení
+    try:
+        calc_df = pd.merge(df_yr, loc_to_merge, on='mdh', how='inner')
+        calc_df = calc_df.sort_values('datetime').reset_index(drop=True)
+    except KeyError as e:
+        st.error(f"Chyba při propojování dat: Chybí sloupec {e}")
+        st.stop()
 
-    if st.button("🚀 SPUSTIT OPTIMALIZACI"):
-        T = len(calc_df)
-        model = pulp.LpProblem("Dispatch", pulp.LpMaximize)
-        
-        # Proměnné
-        q_kgj = pulp.LpVariable.dicts("q_kgj", range(T), 0, k_th)
-        on = pulp.LpVariable.dicts("on", range(T), 0, 1, cat="Binary")
-        q_boil = pulp.LpVariable.dicts("q_boil", range(T), 0)
+    if calc_df.empty:
+        st.warning("⚠️ Po propojení dat vznikla prázdná tabulka. Zkontroluj, zda se roky v obou souborech shodují (nebo zda funguje MDH párování).")
+    else:
+        with st.expander("🛠️ Technické parametry KGJ", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                k_th = st.number_input("Tepelný výkon [MW]", value=1.09)
+                k_el = st.number_input("Elektrický výkon [MW]", value=0.999)
+            with c2:
+                k_eff = st.number_input("Tepelná účinnost", value=0.46)
+                k_serv = st.number_input("Servis [EUR/hod]", value=12.0)
+            with c3:
+                dist_ee = st.number_input("Distribuce nákup [EUR]", value=33.0)
+                b_eff = st.number_input("Účinnost kotle", value=0.95)
 
-        # Logika marží pro zobrazení
-        calc_df['Margin_KGJ'] = (calc_df['ee_price_mod'] * (k_el/k_th)) + calc_df['heat_price'] - ((calc_df['gas_price_mod'] / k_eff) + (k_serv / k_th))
-        calc_df['Margin_Boiler'] = calc_df['heat_price'] - (calc_df['gas_price_mod'] / b_eff)
-        
-        # Constraints & Objective
-        for t in range(T):
-            model += q_kgj[t] + q_boil[t] >= 0.99 * calc_df.loc[t, 'heat_demand']
-            model += q_kgj[t] <= k_th * on[t]
-            model += q_kgj[t] >= 0.55 * k_th * on[t]
+        if st.button("🚀 SPUSTIT OPTIMALIZACI"):
+            T = len(calc_df)
+            model = pulp.LpProblem("Dispatch", pulp.LpMaximize)
+            
+            # Proměnné
+            q_kgj = pulp.LpVariable.dicts("q_kgj", range(T), 0, k_th)
+            on = pulp.LpVariable.dicts("on", range(T), 0, 1, cat="Binary")
+            q_boil = pulp.LpVariable.dicts("q_boil", range(T), 0)
 
-        # Profit (Zjednodušený pro rychlost)
-        model += pulp.lpSum([q_kgj[t] * calc_df.loc[t, 'Margin_KGJ'] + q_boil[t] * calc_df.loc[t, 'Margin_Boiler'] for t in range(T)])
-        model.solve(pulp.PULP_CBC_CMD(msg=0))
+            # Logika marží
+            calc_df['Margin_KGJ'] = (calc_df['ee_price_mod'] * (k_el/k_th)) + calc_df['heat_price'] - ((calc_df['gas_price_mod'] / k_eff) + (k_serv / k_th))
+            calc_df['Margin_Boiler'] = calc_df['heat_price'] - (calc_df['gas_price_mod'] / b_eff)
+            
+            # Constraints
+            for t in range(T):
+                model += q_kgj[t] + q_boil[t] >= 0.99 * calc_df.loc[t, 'heat_demand']
+                model += q_kgj[t] <= k_th * on[t]
+                model += q_kgj[t] >= 0.55 * k_th * on[t]
 
-        st.success(f"Hotovo! Odhadovaný hrubý zisk: {pulp.value(model.objective):,.0f} EUR")
-        
-        # Graf výsledků
-        calc_df['KGJ_Output'] = [q_kgj[t].value() for t in range(T)]
-        fig_res = go.Figure()
-        fig_res.add_trace(go.Scatter(x=calc_df['datetime'], y=calc_df['heat_demand'], name="Poptávka", line=dict(color='black')))
-        fig_res.add_trace(go.Bar(x=calc_df['datetime'], y=calc_df['KGJ_Output'], name="Výkon KGJ"))
-        st.plotly_chart(fig_res, use_container_width=True)
+            model += pulp.lpSum([q_kgj[t] * calc_df.loc[t, 'Margin_KGJ'] + q_boil[t] * calc_df.loc[t, 'Margin_Boiler'] for t in range(T)])
+            model.solve(pulp.PULP_CBC_CMD(msg=0))
+
+            st.success(f"Hotovo! Odhadovaný hrubý zisk: {pulp.value(model.objective):,.0f} EUR")
+            
+            # Graf výsledků
+            calc_df['KGJ_Output'] = [q_kgj[t].value() for t in range(T)]
+            fig_res = go.Figure()
+            fig_res.add_trace(go.Scatter(x=calc_df['datetime'], y=calc_df['heat_demand'], name="Poptávka", line=dict(color='black')))
+            fig_res.add_trace(go.Bar(x=calc_df['datetime'], y=calc_df['KGJ_Output'], name="Výkon KGJ"))
+            st.plotly_chart(fig_res, use_container_width=True)

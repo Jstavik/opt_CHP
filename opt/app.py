@@ -13,25 +13,31 @@ if 'loc_data' not in st.session_state: st.session_state.loc_data = None
 
 st.title("🎯 KGJ Strategy & Dispatch Optimizer")
 
-# --- SIDEBAR: TRŽNÍ DATA (FWD křivka EE_ZP.xlsx) ---
+# --- SIDEBAR: TRŽNÍ DATA ---
 st.sidebar.header("📈 Tržní FWD Křivky")
 fwd_file = st.sidebar.file_uploader("Nahraj 'FWD křivka EE_ZP.xlsx'", type=["xlsx"])
 
 if fwd_file:
+    # Načteme vše a převedeme názvy na malé písmena pro jistotu
     df_fwd = pd.read_excel(fwd_file)
-    # Mapování tvých názvů na interní názvy
+    df_fwd.columns = [str(c).strip() for c in df_fwd.columns]
+    
+    # Mapování tvých názvů z obrázku
     rename_map = {
         'Datum': 'datetime',
         'FWD (EUR/MWh)': 'ee_price',
         'FWD plyn (EUR/MWh)': 'gas_price'
     }
     df_fwd = df_fwd.rename(columns=rename_map)
-    df_fwd['datetime'] = pd.to_datetime(df_fwd['datetime'])
-    st.session_state.fwd_data = df_fwd
 
-if st.session_state.fwd_data is not None:
-    years = sorted(st.session_state.fwd_data['datetime'].dt.year.unique())
-    sel_year = st.sidebar.selectbox("Vyber rok pro výpočet", years)
+    # OPRAVA CHYBY: errors='coerce' změní neplatná data na "NaT" (Not a Time), které pak smažeme
+    df_fwd['datetime'] = pd.to_datetime(df_fwd['datetime'], errors='coerce')
+    
+    # Odstranění řádků, kde není platné datum nebo chybí ceny (řeší ty prázdné řádky mezi roky)
+    df_fwd = df_fwd.dropna(subset=['datetime', 'ee_price'])
+    
+    st.session_state.fwd_data = df_fwd
+    st.sidebar.success(f"Nahráno {len(df_fwd)} platných řádků.")
     
     # Výřez pro daný rok a úprava Base
     df_yr = st.session_state.fwd_data[st.session_state.fwd_data['datetime'].dt.year == sel_year].copy().reset_index(drop=True)
@@ -131,3 +137,4 @@ if st.session_state.fwd_data is not None and st.session_state.loc_data is not No
         
         # Výpočet marginů a triggerů (tvoje logika ze sekce 6) [cite: 7, 8, 11]
         # (Zde by následoval kód pro vytvoření 'res' tabulky a grafů jako v minulé odpovědi)
+

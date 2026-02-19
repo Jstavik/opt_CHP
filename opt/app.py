@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
 
-# --- NASTAVENÍ STRÁNKY ---
+# --- KONFIGURACE ---
 st.set_page_config(page_title="KGJ Strategy Expert", layout="wide")
 
 if 'fwd_data' not in st.session_state: st.session_state.fwd_data = None
@@ -13,128 +13,119 @@ if 'loc_data' not in st.session_state: st.session_state.loc_data = None
 
 st.title("🎯 KGJ Strategy & Dispatch Optimizer")
 
-# --- SIDEBAR: TRŽNÍ DATA ---
+# --- ODOLNÁ FUNKCE PRO ČIŠTĚNÍ DAT (Český formát datumu) ---
+def clean_and_map(df, mapping):
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.rename(columns=mapping)
+    if 'datetime' in df.columns:
+        # dayfirst=True vyřeší tvůj formát 19.02.2026
+        df['datetime'] = pd.to_datetime(df['datetime'], dayfirst=True, errors='coerce')
+        # Smažeme řádky, kde se nepodařilo datum vytvořit (nadpisy, prázdné řádky)
+        df = df.dropna(subset=['datetime'])
+        # Převedeme ceny na čísla (kdyby tam byl text)
+        for col in df.columns:
+            if col != 'datetime' and col != 'mdh':
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
+
+# --- SIDEBAR: TRHY ---
 st.sidebar.header("📈 Tržní FWD Křivky")
 fwd_file = st.sidebar.file_uploader("Nahraj 'FWD křivka EE_ZP.xlsx'", type=["xlsx"])
 
 if fwd_file:
-    # Načteme vše a převedeme názvy na malé písmena pro jistotu
-    df_fwd = pd.read_excel(fwd_file)
-    df_fwd.columns = [str(c).strip() for c in df_fwd.columns]
-    
-    # Mapování tvých názvů z obrázku
-    rename_map = {
-        'Datum': 'datetime',
-        'FWD (EUR/MWh)': 'ee_price',
-        'FWD plyn (EUR/MWh)': 'gas_price'
-    }
-    df_fwd = df_fwd.rename(columns=rename_map)
+    raw_fwd = pd.read_excel(fwd_file)
+    fwd_map = {'Datum': 'datetime', 'FWD (EUR/MWh)': 'ee_price', 'FWD plyn (EUR/MWh)': 'gas_price'}
+    st.session_state.fwd_data = clean_and_map(raw_fwd, fwd_map)
 
-    # OPRAVA CHYBY: errors='coerce' změní neplatná data na "NaT" (Not a Time), které pak smažeme
-    df_fwd['datetime'] = pd.to_datetime(df_fwd['datetime'], errors='coerce')
+if st.session_state.fwd_data is not None:
+    fwd_df = st.session_state.fwd_data
+    years = sorted(fwd_df['datetime'].dt.year.unique())
+    sel_year = st.sidebar.selectbox("Vyber rok pro výpočet", years)
     
-    # Odstranění řádků, kde není platné datum nebo chybí ceny (řeší ty prázdné řádky mezi roky)
-    df_fwd = df_fwd.dropna(subset=['datetime', 'ee_price'])
-    
-    st.session_state.fwd_data = df_fwd
-    st.sidebar.success(f"Nahráno {len(df_fwd)} platných řádků.")
-    
-    # Výřez pro daný rok a úprava Base
-    df_yr = st.session_state.fwd_data[st.session_state.fwd_data['datetime'].dt.year == sel_year].copy().reset_index(drop=True)
+    df_yr = fwd_df[fwd_df['datetime'].dt.year == sel_year].copy().reset_index(drop=True)
     
     st.sidebar.subheader("Úpravy cen")
-    ee_base_orig = df_yr['ee_price'].mean()
-    st.sidebar.write(f"Původní EE Base: {ee_base_orig:.2f} EUR")
     ee_shift = st.sidebar.number_input("Posun EE Base [EUR/MWh]", value=0.0)
     df_yr['ee_price'] += ee_shift
-    
-    gas_base_orig = df_yr['gas_price'].mean()
-    st.sidebar.write(f"Původní Plyn Base: {gas_base_orig:.2f} EUR")
     gas_shift = st.sidebar.number_input("Posun Plyn Base [EUR/MWh]", value=0.0)
     df_yr['gas_price'] += gas_shift
 
-# --- HLAVNÍ ČÁST: LOKALITA ---
+# --- HLAVNÍ: LOKALITA ---
 st.subheader("📍 Data lokality")
-loc_file = st.file_uploader("Nahraj data lokality (Teplo a Poptávka)", type=["xlsx"])
+loc_file = st.file_uploader("Nahraj data lokality (např. Behounkova)", type=["xlsx"])
 
 if loc_file:
-    df_loc = pd.read_excel(loc_file)
-    # Mapování tvých názvů pro lokalitu
-    loc_rename = {
-        'Datum': 'datetime',
-        'Teplo (EUR/MWh)': 'heat_price',
-        'Behounkova DHV celkemMW': 'heat_demand'
-    }
-    df_loc = df_loc.rename(columns=loc_rename)
-    df_loc['datetime'] = pd.to_datetime(df_loc['datetime'])
-    st.session_state.loc_data = df_loc
+    raw_loc = pd.read_excel(loc_file)
+    loc_map = {'Datum': 'datetime', 'Teplo (EUR/MWh)': 'heat_price', 'Behounkova DHV celkemMW': 'heat_demand'}
+    st.session_state.loc_data = clean_and_map(raw_loc, loc_map)
 
+# --- VÝPOČET ---
 if st.session_state.fwd_data is not None and st.session_state.loc_data is not None:
-    # Přesvátkování (Join na základě měsíce, dne a hodiny)
     df_yr['mdh'] = df_yr['datetime'].dt.strftime('%m-%d-%H')
     st.session_state.loc_data['mdh'] = st.session_state.loc_data['datetime'].dt.strftime('%m-%d-%H')
     
     calc_df = pd.merge(df_yr, st.session_state.loc_data[['mdh', 'heat_price', 'heat_demand']], on='mdh', how='inner')
     calc_df = calc_df.sort_values('datetime').reset_index(drop=True)
 
-    # Parametry technologií (z tvého původního behouvkova_opt.txt) 
-    with st.expander("⚙️ Technické parametry", expanded=False):
+    with st.expander("🛠️ Technické parametry", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
-            kgj_heat_p = st.number_input("KGJ Tepelný výkon [MW]", value=1.09) [cite: 1]
-            kgj_el_p = st.number_input("KGJ Elektrický výkon [MW]", value=0.999) [cite: 1]
-            kgj_eff = st.number_input("KGJ Účinnost (tepelná)", value=0.46) [cite: 1]
-            kgj_serv = st.number_input("Servis [EUR/hod]", value=12.0) [cite: 1]
+            kgj_th = st.number_input("KGJ Tepelný výkon [MW]", value=1.09)
+            kgj_el = st.number_input("KGJ Elektrický výkon [MW]", value=0.999)
+            kgj_eff = st.number_input("KGJ Tepelná účinnost", value=0.46)
+            kgj_serv = st.number_input("Servis [EUR/hod]", value=12.0)
         with c2:
-            boiler_eff = st.number_input("Účinnost pl. kotle", value=0.95) [cite: 1]
-            eboil_eff = st.number_input("Účinnost el. kotle", value=0.98) [cite: 1]
-            dist_cost = st.number_input("Distribuce EE [EUR/MWh]", value=33.0) [cite: 1]
+            boil_max = st.number_input("Plynový kotel max [MW]", value=3.91)
+            eboil_max = st.number_input("Elektrokotel max [MW]", value=0.605)
+            dist_c = st.number_input("Distribuce EE nákup [EUR/MWh]", value=33.0)
 
     if st.button("🚀 SPUSTIT OPTIMALIZACI"):
         T = len(calc_df)
-        model = pulp.LpProblem("KGJ_Dispatch", pulp.LpMaximize) [cite: 2]
+        model = pulp.LpProblem("KGJ_Dispatch", pulp.LpMaximize)
 
-        # Proměnné [cite: 2]
-        q_kgj = pulp.LpVariable.dicts("q_kgj", range(T), 0, kgj_heat_p)
-        q_boil = pulp.LpVariable.dicts("q_boil", range(T), 0, 3.91) # Max boiler z tvého kódu 
-        q_eboil = pulp.LpVariable.dicts("q_eboil", range(T), 0, 0.605) [cite: 1]
-        kgj_on = pulp.LpVariable.dicts("on", range(T), 0, 1, cat="Binary") [cite: 2]
-        ee_sold = pulp.LpVariable.dicts("ee_sold", range(T), 0)
-        ee_grid = pulp.LpVariable.dicts("ee_grid", range(T), 0)
+        # Proměnné
+        q_kgj = pulp.LpVariable.dicts("q_kgj", range(T), 0, kgj_th)
+        q_boil = pulp.LpVariable.dicts("q_boil", range(T), 0, boil_max)
+        q_eboil = pulp.LpVariable.dicts("q_eboil", range(T), 0, eboil_max)
+        kgj_on = pulp.LpVariable.dicts("on", range(T), 0, 1, cat="Binary")
+        
+        # Pomocné koeficienty
+        kgj_gas_input = kgj_th / kgj_eff
+        kgj_el_per_h = kgj_el / kgj_th
+        kgj_gas_per_h = kgj_gas_input / kgj_th
 
-        # Koeficienty 
-        kgj_gas_per_h = (kgj_heat_p / kgj_eff) / kgj_heat_p
-        kgj_el_per_h = kgj_el_p / kgj_heat_p
-
-        # Constraints [cite: 3, 4]
+        # Constraints
         for t in range(T):
-            h_req = 0.99 * calc_df.loc[t, "heat_demand"] [cite: 1]
-            model += q_kgj[t] + q_boil[t] + q_eboil[t] >= h_req [cite: 3]
-            model += q_kgj[t] <= kgj_heat_p * kgj_on[t]
-            model += q_kgj[t] >= 0.55 * kgj_heat_p * kgj_on[t] [cite: 1]
-            
-            ee_prod = q_kgj[t] * kgj_el_per_h
-            model += ee_sold[t] <= ee_prod # Zjednodušená bilance pro ilustraci [cite: 3]
-            model += q_eboil[t] <= eboil_eff * (ee_grid[t] + (ee_prod - ee_sold[t])) [cite: 4]
+            h_req = 0.99 * calc_df.loc[t, "heat_demand"]
+            model += q_kgj[t] + q_boil[t] + q_eboil[t] >= h_req
+            model += q_kgj[t] <= kgj_th * kgj_on[t]
+            model += q_kgj[t] >= 0.55 * kgj_th * kgj_on[t]
 
-        # Objective (Profit) [cite: 5, 6]
+        # Objective (Zisk)
         profit = []
         for t in range(T):
             ee = calc_df.loc[t, "ee_price"]
             gas = calc_df.loc[t, "gas_price"]
             hp = calc_df.loc[t, "heat_price"]
-            h_dem = calc_df.loc[t, "heat_demand"]
             
-            rev = (hp * 0.99 * h_dem) + (ee * ee_sold[t]) [cite: 5]
-            cost = (gas * (q_kgj[t] * kgj_gas_per_h + q_boil[t] / boiler_eff)) + \
-                   ((ee + dist_cost) * ee_grid[t]) + (kgj_serv * kgj_on[t]) [cite: 5, 6]
-            profit.append(rev - cost)
-        
+            # Zjednodušený ekonomický model (revize dle tvého originálu)
+            rev = (hp * 0.99 * calc_df.loc[t, "heat_demand"]) + (ee * q_kgj[t] * kgj_el_per_h)
+            cost = (gas * (q_kgj[t] * kgj_gas_per_h + q_boil[t]/0.95)) + (kgj_serv * kgj_on[t])
+            # Náklady na elektrokotel z gridu (pokud ee_price + distribuce)
+            eb_cost = (ee + dist_c) * (q_eboil[t]/0.98)
+            profit.append(rev - cost - eb_cost)
+
         model += pulp.lpSum(profit)
         model.solve(pulp.PULP_CBC_CMD(msg=0))
 
-        st.success("Hotovo!")
-        
-        # Výpočet marginů a triggerů (tvoje logika ze sekce 6) [cite: 7, 8, 11]
-        # (Zde by následoval kód pro vytvoření 'res' tabulky a grafů jako v minulé odpovědi)
+        st.success(f"Optimalizace dokončena! Celkový zisk: {pulp.value(model.objective):,.0f} EUR")
 
+        # --- VÝSLEDKY ---
+        calc_df['q_kgj'] = [q_kgj[t].value() for t in range(T)]
+        calc_df['q_boil'] = [q_boil[t].value() for t in range(T)]
+        calc_df['q_eboil'] = [q_eboil[t].value() for t in range(T)]
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=calc_df['datetime'], y=calc_df['heat_demand'], name="Poptávka", line=dict(color='black')))
+        fig.add_trace(go.Bar(x=calc_df['datetime'], y=calc_df['q_kgj'], name="KGJ Teplo"))
+        st.plotly_chart(fig, use_container_width=True)

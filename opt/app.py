@@ -161,18 +161,37 @@ if st.session_state.fwd_data is not None and st.session_state.loc_data is not No
         model += pulp.lpSum(profit_total)
         model.solve(pulp.PULP_CBC_CMD(msg=0))
 
-        st.success(f"Optimalizace dokončena. Celkový hrubý zisk: {pulp.value(model.objective):,.0f} EUR")
+st.success(f"Optimalizace dokončena. Celkový hrubý zisk: {pulp.value(model.objective):,.0f} EUR")
         
-        # Výsledný graf
-        res = pd.DataFrame({
-            'T': df['datetime_x'],
-            'KGJ': [q_kgj[t].value() for t in range(T)],
-            'Kotel': [q_boil[t].value() for t in range(T)],
-            'EK': [q_ek[t].value() for t in range(T)],
-            'Nákup': [q_ext[t].value() for t in range(T)]
-        })
+        # --- ROBUSTNÍ PŘÍPRAVA DAT PRO GRAF ---
+        # Najdeme správný sloupec s datem (může to být 'datetime', 'datetime_x' nebo první sloupec)
+        t_col = 'datetime_x' if 'datetime_x' in df.columns else ('datetime' if 'datetime' in df.columns else df.columns[0])
+        
+        res = pd.DataFrame({'T': df[t_col]})
+        
+        # Do tabulky výsledků přidáme jen ty zdroje, které mají hodnoty
+        res['KGJ'] = [q_kgj[t].value() for t in range(T)]
+        res['Kotel'] = [q_boil[t].value() for t in range(T)]
+        res['EK'] = [q_ek[t].value() for t in range(T)]
+        res['Nákup'] = [q_ext[t].value() for t in range(T)]
+
+        # --- VYKRESLENÍ ---
         fig_res = go.Figure()
+        
+        # Přidáme barvy pro přehlednost
+        colors = {'KGJ': '#FF9900', 'Kotel': '#1f77b4', 'EK': '#2ca02c', 'Nákup': '#d62728'}
+        
         for c in ['KGJ', 'Kotel', 'EK', 'Nákup']:
-            fig_res.add_trace(go.Bar(x=res['T'], y=res[c], name=c))
-        fig_res.update_layout(barmode='stack', title="Hodinový Dispatch tepla [MW]")
+            # Vykreslíme sloupec jen pokud v něm není samá nula (např. vypnutý kotel)
+            if res[c].sum() > 0.001:
+                fig_res.add_trace(go.Bar(x=res['T'], y=res[c], name=c, marker_color=colors[c]))
+        
+        fig_res.update_layout(
+            barmode='stack', 
+            title="Hodinový Dispatch tepla [MW]",
+            xaxis_title="Datum",
+            yaxis_title="Výkon [MW]",
+            legend_title="Zdroje",
+            hovermode="x unified"
+        )
         st.plotly_chart(fig_res, use_container_width=True)

@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import pulp
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="KGJ Strategy Expert PRO", layout="wide")
@@ -177,7 +176,6 @@ if st.session_state.fwd_data is not None and loc_file is not None:
                         model += on[t + dt] >= start[t]
 
             obj_terms = []
-            profits = []  # Pro pozdější grafy
 
             for t in range(T):
                 p_ee  = float(df['ee_price'].iloc[t])
@@ -212,7 +210,6 @@ if st.session_state.fwd_data is not None and loc_file is not None:
                         p['imp_price'] * q_imp[t]
 
                 obj_terms.append(revenue - costs - p['h_price'] * heat_shortfall[t])
-                profits.append(revenue - costs - p['h_price'] * heat_shortfall[t])  # Ukládání pro grafy
 
             model += pulp.lpSum(obj_terms)
 
@@ -236,87 +233,31 @@ if st.session_state.fwd_data is not None and loc_file is not None:
                 'TES netto': [pulp.value(tes_out[t]) - pulp.value(tes_in[t]) for t in range(T)],
                 'Shortfall': [pulp.value(heat_shortfall[t]) for t in range(T)],
                 'TES SOC': [pulp.value(tes_soc[t+1]) for t in range(T)],
-                'BESS SOC': [pulp.value(bess_soc[t+1]) for t in range(T)],
                 'EE export': [pulp.value(ee_export[t]) for t in range(T)],
                 'EE import': [pulp.value(ee_import[t]) for t in range(T)],
-                'EE KGJ': [pulp.value(q_kgj[t]) * (p['k_el'] / p['k_th']) if use_kgj else 0 for t in range(T)],
-                'EE FVE': [float(df['FVE (MW)'].iloc[t]) if use_fve and 'FVE (MW)' in df else 0.0 for t in range(T)],
-                'EE BESS dis': [pulp.value(bess_dis[t]) for t in range(T)],
-                'EE EK': [pulp.value(q_ek[t]) / 0.95 for t in range(T)],
-                'EE BESS cha': [pulp.value(bess_cha[t]) for t in range(T)],
-                'Zisk': profits,
             })
 
-            # Klíčové metriky
-            total_profit = res['Zisk'].sum()
-            total_shortfall = res['Shortfall'].sum()
-            avg_coverage = (1 - total_shortfall / (res['Poptávka tepla'].sum() * p['h_cover'])) * 100
-            total_ee_export = res['EE export'].sum()
-            total_ee_import = res['EE import'].sum()
-
-            st.subheader("📈 Klíčové metriky")
-            col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("Celkový zisk [€]", f"{total_profit:.0f}")
-            col2.metric("Celkový shortfall [MWh]", f"{total_shortfall:.1f}")
-            col3.metric("Průměrné pokrytí [%]", f"{avg_coverage:.1f}")
-            col4.metric("EE export [MWh]", f"{total_ee_export:.1f}")
-            col5.metric("EE import [MWh]", f"{total_ee_import:.1f}")
-
-            # Stackplot tepla (pokrytí poptávky)
-            st.subheader("🔥 Pokrytí tepelné poptávky (stack chart)")
+            # Stackplot tepla
+            st.subheader("🔥 Pokrytí tepelné poptávky")
             fig_heat = go.Figure()
-            sources = ['KGJ', 'Kotel', 'Elektrokotel', 'Import tepla', 'TES netto']
-            colors = ['#2ecc71', '#3498db', '#9b59b6', '#e74c3c', '#f1c40f']
-            for src, col in zip(sources, colors):
-                fig_heat.add_trace(go.Scatter(x=res['Čas'], y=res[src], name=src,
-                                              stackgroup='heat', fillcolor=col, mode='none'))
+            for col, color in zip(['KGJ','Kotel','Elektrokotel','Import tepla','TES netto'],
+                                  ['#2ecc71','#3498db','#9b59b6','#e74c3c','#f1c40f']):
+                fig_heat.add_trace(go.Scatter(x=res['Čas'], y=res[col], name=col,
+                                              stackgroup='one', fillcolor=color, line_width=0))
             fig_heat.add_trace(go.Scatter(x=res['Čas'], y=res['Shortfall'], name='Nedodáno',
-                                          stackgroup='heat', fillcolor='rgba(0,0,0,0.4)', mode='none'))
+                                          stackgroup='one', fillcolor='rgba(0,0,0,0.4)'))
             fig_heat.add_trace(go.Scatter(x=res['Čas'], y=res['Poptávka tepla'] * p['h_cover'],
-                                          name='Cílová poptávka', mode='lines', line=dict(color='black', width=2, dash='dot')))
-            fig_heat.update_layout(height=500, title="Složení tepelné výroby v čase")
+                                          name='Cílová poptávka', mode='lines', line=dict(color='black', width=2.5, dash='dot')))
+            fig_heat.update_layout(barmode='stack', height=500)
             st.plotly_chart(fig_heat, use_container_width=True)
 
-            # Stackplot EE bilance
-            st.subheader("⚡ Elektrická bilance (stack chart)")
-            fig_ee = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                                   subplot_titles=("Výroba EE", "Spotřeba EE"))
-            
-            # Výroba (positive stack)
-            prod_sources = ['EE KGJ', 'EE FVE', 'EE import', 'EE BESS dis']
-            prod_colors = ['#27ae60', '#f39c12', '#2980b9', '#8e44ad']
-            for src, col in zip(prod_sources, prod_colors):
-                fig_ee.add_trace(go.Scatter(x=res['Čas'], y=res[src], name=src,
-                                            stackgroup='prod', fillcolor=col, mode='none'), row=1, col=1)
-            
-            # Spotřeba (negative stack)
-            cons_sources = ['EE EK', 'EE export', 'EE BESS cha']
-            cons_colors = ['#c0392b', '#16a085', '#34495e']
-            for src, col in zip(cons_sources, cons_colors):
-                fig_ee.add_trace(go.Scatter(x=res['Čas'], y=-res[src], name=src,
-                                            stackgroup='cons', fillcolor=col, mode='none'), row=2, col=1)
-            
-            fig_ee.update_layout(height=600, title="Bilance elektřiny: Výroba vs. Spotřeba")
-            st.plotly_chart(fig_ee, use_container_width=True)
-
-            # Grafy SOC pro akumulátory
-            st.subheader("🔋 Stavy akumulátorů")
-            fig_acc = make_subplots(rows=1, cols=2, shared_yaxes=False,
-                                    subplot_titles=("TES SOC", "BESS SOC"))
-            fig_acc.add_trace(go.Scatter(x=res['Čas'], y=res['TES SOC'], name='TES SOC', line=dict(color='#e67e22')), row=1, col=1)
-            fig_acc.add_hline(y=p['tes_cap'], row=1, col=1, line_dash="dot", annotation_text="Max TES")
-            fig_acc.add_trace(go.Scatter(x=res['Čas'], y=res['BESS SOC'], name='BESS SOC', line=dict(color='#3498db')), row=1, col=2)
-            fig_acc.add_hline(y=p['bess_cap'], row=1, col=2, line_dash="dot", annotation_text="Max BESS")
-            fig_acc.update_layout(height=400)
-            st.plotly_chart(fig_acc, use_container_width=True)
-
-            # Kumulativní zisk
-            st.subheader("💰 Kumulativní hospodářský výsledek")
-            res['Kumulativní zisk'] = res['Zisk'].cumsum()
-            fig_profit = px.area(res, x='Čas', y='Kumulativní zisk', title="Kumulativní zisk v čase",
-                                 color_discrete_sequence=['#2ecc71'])
-            fig_profit.update_layout(height=400)
-            st.plotly_chart(fig_profit, use_container_width=True)
+            # TES SOC
+            st.subheader("🔋 Stav nádrže TES")
+            fig_tes = go.Figure()
+            fig_tes.add_trace(go.Scatter(x=res['Čas'], y=res['TES SOC'], name='TES SOC', line=dict(color='#e67e22')))
+            fig_tes.add_hline(y=p['tes_cap'], line_dash="dot", annotation_text="Max kapacita")
+            fig_tes.update_layout(height=400)
+            st.plotly_chart(fig_tes, use_container_width=True)
 
             # Ukázka tabulky
             st.subheader("Detail (prvních 48 hodin)")

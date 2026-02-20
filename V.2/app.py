@@ -26,7 +26,6 @@ with st.sidebar:
         sel_year = st.selectbox("Rok pro analýzu", years)
         df_year = df_raw[df_raw[date_col].dt.year == sel_year].copy()
         
-        # Výpočet a zobrazení průměrů
         avg_ee_raw = float(df_year.iloc[:, 1].mean())
         avg_gas_raw = float(df_year.iloc[:, 2].mean())
         
@@ -108,7 +107,6 @@ if st.session_state.fwd_data is not None and loc_file:
     df_loc.rename(columns={df_loc.columns[0]: 'datetime'}, inplace=True)
     df_loc['datetime'] = pd.to_datetime(df_loc['datetime'], dayfirst=True)
     
-    # Merge podle času (řeší tvůj problém s importem)
     df = pd.merge(st.session_state.fwd_data, df_loc, on='datetime', how='inner')
     T = len(df)
 
@@ -130,5 +128,56 @@ if st.session_state.fwd_data is not None and loc_file:
         ee_export = pulp.LpVariable.dicts("ee_export", range(T), 0)
         ee_import = pulp.LpVariable.dicts("ee_import", range(T), 0)
 
+        # Počáteční stavy
+        model += tes_soc[0] == p['tes_cap'] * 0.5
+        model += bess_soc[0] == p['bess_cap'] * 0.2
+
         obj = []
-        model += tes_soc[0] == p['tes_cap'] *
+        for t in range(T):
+            p_ee = df.loc[t, 'ee_price']
+            p_gas = df.loc[t, 'gas_price']
+            h_dem = df.iloc[t, 4]
+            fve = df.iloc[t, 7] if len(df.columns) > 7 else 0
+
+            # Bilance tepla s nádrží
+            model += q_kgj[t] + q_boil[t] + q_ek[t] + q_imp[t] + (tes_soc[t]*(1-p['tes_loss']) - tes_soc[t+1]) >= h_dem * p['h_cover']
+            model += q_kgj[t] <= p['k_th'] * on[t]
+            model += q_kgj[t] >= p['k_min'] * p['k_th'] * on[t]
+
+            # Bilance EE s baterií
+            ee_kgj = q_kgj[t] * (p['k_el'] / p['k_th'])
+            model += ee_kgj + fve + ee_import[t] + bess_dis[t] == (q_ek[t]/0.98) + bess_cha[t] + ee_export[t]
+            model += bess_soc[t+1] == bess_soc[t] + (bess_cha[t]*0.92) - (bess_dis[t]/0.92)
+
+            # Ekonomika
+            revenue = (p['h_price'] * h_dem * p['h_cover']) + (p_ee - p['dist_ee_sell']) * ee_export[t]
+            costs = (p_gas + p['gas_dist']) * (q_kgj[t]/p['k_eff_th'] + q_boil[t]/0.95) + \
+                    (p_ee + p['dist_ee_buy']) * ee_import[t] + (12.0 * on[t]) + (q_imp[t] * 150)
+            obj.append(revenue - costs)
+
+        model += pulp.lpSum(obj)
+        model.solve(pulp.PULP_CBC_CMD(msg=0))
+
+        # --- REPORT ---
+        st.success(f"Optimalizace dokončena. Zisk: {pulp.value(model.objective):,.0f} EUR")
+        
+        res = pd.DataFrame({
+            'datetime': df['datetime'],
+            'KGJ': [q_kgj[t].value() for t in range(T)],
+            'Kotel': [q_boil[t].value() for t in range(T)],
+            'EK': [q_ek[t].value() for t in range(T)],
+            'TES_SOC': [tes_soc[t].value() for t in range(T)],
+            'BESS_SOC': [bess_soc[t].value() for t in range(T)]
+        })
+
+        fig_res = go.Figure()
+        fig_res.add_trace(go.Scatter(x=res['datetime'], y=res['KGJ'], name="KGJ", stackgroup='one', fill='tonexty'))
+        fig_res.add_trace(go.Scatter(x=res['datetime'], y=res['Kotel'], name="Kotel", stackgroup='one', fill='tonexty'))
+        fig_res.add_trace(go.Scatter(x=res['datetime'], y=res['EK'], name="Elektrokotel", stackgroup='one', fill='tonexty'))
+        fig_res.add_trace(go.Scatter(x=res['datetime'], y=df.iloc[:, 4], name="Poptávka", line=dict(color='white', dash='dash')))
+        st.plotly_chart(fig_res, use_container_width=True)
+        
+        fig_soc = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_soc.add_trace(go.Scatter(x=res['datetime'], y=res['TES_SOC'], name="Nádrž (MWh)", fill='tozeroy'), secondary_y=False)
+        fig_soc.add_trace(go.Scatter(x=res['datetime'], y=res['BESS_SOC'], name="Baterie (MWh)", line=dict(color='yellow')), secondary_y=True)
+        st.plotly_chart(fig_soc, use_container_width=True)

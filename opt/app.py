@@ -178,7 +178,7 @@ if st.session_state.fwd_data is not None and st.session_state.loc_data is not No
         for c in ['KGJ', 'Kotel', 'EK', 'Nákup']:
             if res[c].sum() > 0.001:
                 fig1.add_trace(go.Bar(x=res['T'], y=res[c], name=c, marker_color=colors[c]))
-        fig1.add_trace(go.Scatter(x=res['T'], y=res['Poptávka'], name="Požadavek", line=dict(color='black', dash='dot')))
+        fig1.add_trace(go.Scatter(x=res['T'], y=res['Poptávka'], name="Požadavek", line=dict(color='pink', dash='dot')))
         fig1.update_layout(barmode='stack', title="Hodinový Dispatch zdrojů tepla [MW]", hovermode="x unified")
         st.plotly_chart(fig1, use_container_width=True)
 
@@ -186,8 +186,9 @@ if st.session_state.fwd_data is not None and st.session_state.loc_data is not No
         if res['Deficit'].sum() > 0.1:
             st.warning("⚠️ Systém nedokáže pokrýt veškerou poptávku!")
             fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=res['T'], y=res['Deficit'], fill='tozeroy', name="Nedostatek tepla", line=dict(color='black')))
+            fig2.add_trace(go.Scatter(x=res['T'], y=res['Deficit'], fill='tozeroy', name="Nedostatek tepla", line=dict(color='pink')))
             fig2.update_layout(title="Hodinový deficit tepla (Nepokryto) [MW]", yaxis_title="Výkon [MW]")
             st.plotly_chart(fig2, use_container_width=True)
         else:
             st.info("✅ Poptávka je plně pokryta.")
+

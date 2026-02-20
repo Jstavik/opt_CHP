@@ -6,12 +6,11 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="KGJ Strategy Expert PRO", layout="wide")
 
-# Inicializace stavu
 if 'fwd_data' not in st.session_state: st.session_state.fwd_data = None
 
 st.title("🚀 KGJ Strategy & Dispatch Optimizer PRO")
 
-# --- 1. SIDEBAR: CENY A EDITACE ---
+# --- 1. SIDEBAR: CENY ---
 with st.sidebar:
     st.header("📈 1. Tržní ceny (FWD)")
     fwd_file = st.file_uploader("Nahraj FWD křivku (Excel)", type=["xlsx"])
@@ -30,8 +29,6 @@ with st.sidebar:
         avg_gas_raw = float(df_year.iloc[:, 2].mean())
         
         st.subheader("🛠️ Úprava na aktuální trh")
-        st.info(f"Původní průměry: EE {avg_ee_raw:.2f} | Plyn {avg_gas_raw:.2f}")
-        
         ee_market_new = st.number_input("Nová cílová cena EE [EUR]", value=avg_ee_raw)
         gas_market_new = st.number_input("Nová cílová cena Plyn [EUR]", value=avg_gas_raw)
         
@@ -45,26 +42,15 @@ with st.sidebar:
         st.session_state.fwd_data = df_fwd
 
     st.divider()
-    st.header("⚙️ 2. Aktivní technologie")
+    st.header("⚙️ 2. Technologie")
     use_kgj = st.checkbox("Kogenerace (KGJ)", value=True)
     use_boil = st.checkbox("Plynový kotel", value=True)
     use_ek = st.checkbox("Elektrokotel", value=True)
     use_tes = st.checkbox("Nádrž (TES)", value=True)
     use_bess = st.checkbox("Baterie (BESS)", value=True)
     use_fve = st.checkbox("Fotovoltaika (FVE)", value=True)
-    use_ext_heat = st.checkbox("Nákup tepla (Import)", value=True)
 
-# --- 2. GRAF CEN (POROVNÁNÍ) ---
-if st.session_state.fwd_data is not None:
-    with st.expander("📊 Náhled upravených tržních cen", expanded=True):
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1)
-        fig.add_trace(go.Scatter(x=st.session_state.fwd_data['datetime'], y=st.session_state.fwd_data['ee_original'], name="EE Původní", line=dict(color='rgba(0,255,0,0.2)', dash='dot')), row=1, col=1)
-        fig.add_trace(go.Scatter(x=st.session_state.fwd_data['datetime'], y=st.session_state.fwd_data['ee_price'], name="EE Upravená", line=dict(color='green')), row=1, col=1)
-        fig.add_trace(go.Scatter(x=st.session_state.fwd_data['datetime'], y=st.session_state.fwd_data['gas_original'], name="Plyn Původní", line=dict(color='rgba(255,0,0,0.2)', dash='dot')), row=2, col=1)
-        fig.add_trace(go.Scatter(x=st.session_state.fwd_data['datetime'], y=st.session_state.fwd_data['gas_price'], name="Plyn Upravená", line=dict(color='red')), row=2, col=1)
-        st.plotly_chart(fig, use_container_width=True)
-
-# --- 3. PARAMETRY ---
+# --- 2. PARAMETRY ---
 t_tech, t_eco, t_acc = st.tabs(["Technika", "Ekonomika", "Akumulace"])
 p = {}
 with t_tech:
@@ -97,13 +83,16 @@ with t_acc:
         p['bess_cap'] = st.number_input("BESS kapacita [MWh]", value=1.0)
         p['bess_p'] = st.number_input("BESS výkon [MW]", value=0.5)
 
-# --- 4. VÝPOČET ---
+# --- 3. VÝPOČET ---
 st.divider()
 loc_file = st.file_uploader("3️⃣ Nahraj lokální data (aki11)", type=["xlsx"])
 
 if st.session_state.fwd_data is not None and loc_file:
     df_loc = pd.read_excel(loc_file)
     df_loc.columns = [str(c).strip() for c in df_loc.columns]
+    # POJISTKA 1: Vyplnění prázdných hodnot nulou
+    df_loc = df_loc.fillna(0)
+    
     df_loc.rename(columns={df_loc.columns[0]: 'datetime'}, inplace=True)
     df_loc['datetime'] = pd.to_datetime(df_loc['datetime'], dayfirst=True)
     
@@ -113,11 +102,9 @@ if st.session_state.fwd_data is not None and loc_file:
     if st.button("🏁 SPUSTIT KOMPLETNÍ OPTIMALIZACI"):
         model = pulp.LpProblem("Dispatcher_Complex", pulp.LpMaximize)
         
-        # Proměnné
         q_kgj = pulp.LpVariable.dicts("q_KGJ", range(T), 0)
         q_boil = pulp.LpVariable.dicts("q_Boil", range(T), 0, p['b_max'])
         q_ek = pulp.LpVariable.dicts("q_EK", range(T), 0, p['ek_max'])
-        q_imp = pulp.LpVariable.dicts("q_Imp", range(T), 0)
         on = pulp.LpVariable.dicts("on", range(T), 0, 1, cat="Binary")
         
         tes_soc = pulp.LpVariable.dicts("TES_SOC", range(T+1), 0, p['tes_cap'])
@@ -128,23 +115,23 @@ if st.session_state.fwd_data is not None and loc_file:
         ee_export = pulp.LpVariable.dicts("ee_export", range(T), 0)
         ee_import = pulp.LpVariable.dicts("ee_import", range(T), 0)
 
-        # Počáteční stavy
         model += tes_soc[0] == p['tes_cap'] * 0.5
         model += bess_soc[0] == p['bess_cap'] * 0.2
 
         obj = []
         for t in range(T):
-            p_ee = df.loc[t, 'ee_price']
-            p_gas = df.loc[t, 'gas_price']
-            h_dem = df.iloc[t, 4]
-            fve = df.iloc[t, 7] if len(df.columns) > 7 else 0
+            # POJISTKA 2: Přesné načtení hodnot (poptávka je 2. sloupec v aki11, FVE je 5. sloupec)
+            p_ee = float(df.loc[t, 'ee_price'])
+            p_gas = float(df.loc[t, 'gas_price'])
+            h_dem = float(df.iloc[t, 4]) # Sloupec 'Poptávka po teplo (MW)'
+            fve = float(df.iloc[t, 7]) if use_fve else 0.0 # Sloupec 'FVE (MW)'
 
-            # Bilance tepla s nádrží
-            model += q_kgj[t] + q_boil[t] + q_ek[t] + q_imp[t] + (tes_soc[t]*(1-p['tes_loss']) - tes_soc[t+1]) >= h_dem * p['h_cover']
+            # Teplo
+            model += q_kgj[t] + q_boil[t] + q_ek[t] + (tes_soc[t]*(1-p['tes_loss']) - tes_soc[t+1]) >= h_dem * p['h_cover']
             model += q_kgj[t] <= p['k_th'] * on[t]
             model += q_kgj[t] >= p['k_min'] * p['k_th'] * on[t]
 
-            # Bilance EE s baterií
+            # Elektřina
             ee_kgj = q_kgj[t] * (p['k_el'] / p['k_th'])
             model += ee_kgj + fve + ee_import[t] + bess_dis[t] == (q_ek[t]/0.98) + bess_cha[t] + ee_export[t]
             model += bess_soc[t+1] == bess_soc[t] + (bess_cha[t]*0.92) - (bess_dis[t]/0.92)
@@ -152,32 +139,18 @@ if st.session_state.fwd_data is not None and loc_file:
             # Ekonomika
             revenue = (p['h_price'] * h_dem * p['h_cover']) + (p_ee - p['dist_ee_sell']) * ee_export[t]
             costs = (p_gas + p['gas_dist']) * (q_kgj[t]/p['k_eff_th'] + q_boil[t]/0.95) + \
-                    (p_ee + p['dist_ee_buy']) * ee_import[t] + (12.0 * on[t]) + (q_imp[t] * 150)
+                    (p_ee + p['dist_ee_buy']) * ee_import[t] + (12.0 * on[t])
             obj.append(revenue - costs)
 
         model += pulp.lpSum(obj)
         model.solve(pulp.PULP_CBC_CMD(msg=0))
 
-        # --- REPORT ---
         st.success(f"Optimalizace dokončena. Zisk: {pulp.value(model.objective):,.0f} EUR")
         
-        res = pd.DataFrame({
-            'datetime': df['datetime'],
-            'KGJ': [q_kgj[t].value() for t in range(T)],
-            'Kotel': [q_boil[t].value() for t in range(T)],
-            'EK': [q_ek[t].value() for t in range(T)],
-            'TES_SOC': [tes_soc[t].value() for t in range(T)],
-            'BESS_SOC': [bess_soc[t].value() for t in range(T)]
-        })
-
-        fig_res = go.Figure()
-        fig_res.add_trace(go.Scatter(x=res['datetime'], y=res['KGJ'], name="KGJ", stackgroup='one', fill='tonexty'))
-        fig_res.add_trace(go.Scatter(x=res['datetime'], y=res['Kotel'], name="Kotel", stackgroup='one', fill='tonexty'))
-        fig_res.add_trace(go.Scatter(x=res['datetime'], y=res['EK'], name="Elektrokotel", stackgroup='one', fill='tonexty'))
-        fig_res.add_trace(go.Scatter(x=res['datetime'], y=df.iloc[:, 4], name="Poptávka", line=dict(color='white', dash='dash')))
-        st.plotly_chart(fig_res, use_container_width=True)
-        
-        fig_soc = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_soc.add_trace(go.Scatter(x=res['datetime'], y=res['TES_SOC'], name="Nádrž (MWh)", fill='tozeroy'), secondary_y=False)
-        fig_soc.add_trace(go.Scatter(x=res['datetime'], y=res['BESS_SOC'], name="Baterie (MWh)", line=dict(color='yellow')), secondary_y=True)
-        st.plotly_chart(fig_soc, use_container_width=True)
+        # Grafy
+        res = pd.DataFrame({'datetime': df['datetime'], 'KGJ': [q_kgj[t].value() for t in range(T)], 'Kotel': [q_boil[t].value() for t in range(T)], 'EK': [q_ek[t].value() for t in range(T)]})
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=res['datetime'], y=res['KGJ'], name="KGJ", stackgroup='one'))
+        fig.add_trace(go.Scatter(x=res['datetime'], y=res['Kotel'], name="Kotel", stackgroup='one'))
+        fig.add_trace(go.Scatter(x=res['datetime'], y=res['EK'], name="EK", stackgroup='one'))
+        st.plotly_chart(fig, use_container_width=True)

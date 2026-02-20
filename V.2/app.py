@@ -11,7 +11,7 @@ if 'fwd_data' not in st.session_state: st.session_state.fwd_data = None
 
 st.title("🚀 KGJ Strategy & Dispatch Optimizer PRO")
 
-# --- 1. SIDEBAR: CENY (TVOJE LOGIKA) ---
+# --- 1. SIDEBAR: CENY (PŘESNĚ TVOJE LOGIKA) ---
 with st.sidebar:
     st.header("📈 1. Tržní ceny (FWD)")
     fwd_file = st.file_uploader("Nahraj FWD křivku (Excel)", type=["xlsx"])
@@ -76,7 +76,7 @@ with t_eco:
         p['h_price'] = st.number_input("Prodejní cena tepla [EUR/MWh]", value=120.0)
         p['start_cost'] = st.number_input("Náklad na start KGJ [EUR]", value=150.0)
         p['ext_h_price'] = st.number_input("Cena importu tepla [EUR/MWh]", value=250.0)
-        p['penalty'] = 5000  # Penalizace za nedodání (skrytá vysoká hodnota)
+        p['penalty'] = 5000  # Penalizace za nedodání
 
 with t_acc:
     c1, c2 = st.columns(2)
@@ -121,45 +121,12 @@ if st.session_state.fwd_data is not None and loc_file:
             ee_export = pulp.LpVariable.dicts("ee_export", range(T), 0)
             ee_import = pulp.LpVariable.dicts("ee_import", range(T), 0)
 
+            model += tes_soc[0] == p['tes_cap'] * 0.5
+            model += bess_soc[0] == p['bess_cap'] * 0.2
+
             obj = []
             for t in range(T):
                 h_dem = float(df['Poptávka po teple (MW)'].iloc[t])
                 p_ee = float(df['ee_price'].iloc[t])
                 p_gas = float(df['gas_price'].iloc[t])
                 fve = float(df['FVE (MW)'].iloc[t]) if use_fve else 0.0
-
-                # Logika startu a kontinuity
-                if t > 0: model += start[t] >= on[t] - on[t-1]
-                
-                # Bilance tepla (Včetně penalizace za nepokrytí)
-                heat_gen = q_kgj[t] + q_boil[t] + q_ek[t] + (q_imp[t] if use_ext_heat else 0)
-                model += heat_gen + (tes_soc[t]*(1-p['tes_loss']) - tes_soc[t+1]) + unserved[t] >= h_dem
-                
-                # Omezení KGJ
-                model += q_kgj[t] <= p['k_th'] * on[t]
-                model += q_kgj[t] >= p['k_min'] * p['k_th'] * on[t]
-
-                # Bilance EE
-                ee_kgj = q_kgj[t] * (p['k_el'] / p['k_th'])
-                b_eff = p['bess_eff']**0.5
-                model += ee_kgj + fve + ee_import[t] + bess_dis[t] == (q_ek[t]/p['ek_eff']) + bess_cha[t] + ee_export[t]
-                model += bess_soc[t+1] == bess_soc[t] + (bess_cha[t]*b_eff) - (bess_dis[t]/b_eff)
-
-                # Ekonomika: Výnos jen z prodaného tepla (h_dem - unserved)
-                revenue = (p['h_price'] * (h_dem - unserved[t])) + (p_ee - p['dist_ee_sell']) * ee_export[t]
-                costs = (p_gas + p['gas_dist']) * (q_kgj[t]/p['k_eff_th'] + q_boil[t]/0.95) + \
-                        (p_ee + p['dist_ee_buy']) * ee_import[t] + \
-                        (q_imp[t] * p['ext_h_price']) + (start[t] * p['start_cost']) + \
-                        (unserved[t] * p['penalty']) # Brutální pokuta za nedodání
-                obj.append(revenue - costs)
-
-            model += pulp.lpSum(obj)
-            model.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=120))
-
-        # --- SEXY VÝSLEDKY ---
-        st.success(f"Optimalizace hotova. HV: {pulp.value(model.objective):,.0f} EUR")
-        
-        res = pd.DataFrame({
-            'datetime': df['datetime'],
-            'Poptávka': df['Poptávka po teple (MW)'],
-            'KGJ':

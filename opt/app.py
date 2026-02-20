@@ -226,25 +226,67 @@ if st.session_state.fwd_data is not None and loc_file is not None:
         st.write(f"**Status:** {pulp.LpStatus[status]}   |   **Celkový zisk:** {pulp.value(model.objective):+.0f} €")
 
         if status == 1:
-            res = pd.DataFrame({
+            # Extrahujeme hodnoty ihned po solve – bezpečnější
+            res_data = {
                 'Čas': df['datetime'],
                 'Poptávka tepla': df['Poptávka po teple (MW)'],
-                'KGJ': [pulp.value(q_kgj[t]) for t in range(T)],
-                'Kotel': [pulp.value(q_boil[t]) for t in range(T)],
-                'Elektrokotel': [pulp.value(q_ek[t]) for t in range(T)],
-                'Import tepla': [pulp.value(q_imp[t]) for t in range(T)],
-                'TES netto': [pulp.value(tes_out[t]) - pulp.value(tes_in[t]) for t in range(T)],
-                'Shortfall': [pulp.value(heat_shortfall[t]) for t in range(T)],
-                'TES SOC': [pulp.value(tes_soc[t+1]) for t in range(T)],
-                'BESS SOC': [pulp.value(bess_soc[t+1]) for t in range(T)],
-                'EE export': [pulp.value(ee_export[t]) for t in range(T)],
-                'EE import': [pulp.value(ee_import[t]) for t in range(T)],
-                'EE KGJ': [pulp.value(q_kgj[t]) * (p['k_el'] / p['k_th']) if use_kgj else 0 for t in range(T)],
+                'KGJ': [float(pulp.value(q_kgj[t])) for t in range(T)],
+                'Kotel': [float(pulp.value(q_boil[t])) for t in range(T)],
+                'Elektrokotel': [float(pulp.value(q_ek[t])) for t in range(T)],
+                'Import tepla': [float(pulp.value(q_imp[t])) for t in range(T)],
+                'TES netto': [float(pulp.value(tes_out[t]) - pulp.value(tes_in[t])) for t in range(T)],
+                'Shortfall': [float(pulp.value(heat_shortfall[t])) for t in range(T)],
+                'TES SOC': [float(pulp.value(tes_soc[t+1])) for t in range(T)],
+                'BESS SOC': [float(pulp.value(bess_soc[t+1])) for t in range(T)],
+                'EE export': [float(pulp.value(ee_export[t])) for t in range(T)],
+                'EE import': [float(pulp.value(ee_import[t])) for t in range(T)],
+                'EE KGJ': [float(pulp.value(q_kgj[t]) * (p['k_el'] / p['k_th'])) if use_kgj else 0.0 for t in range(T)],
                 'EE FVE': [float(df['FVE (MW)'].iloc[t]) if use_fve and 'FVE (MW)' in df else 0.0 for t in range(T)],
-                'EE BESS dis': [pulp.value(bess_dis[t]) for t in range(T)],
-                'EE EK': [pulp.value(q_ek[t]) / 0.95 for t in range(T)],
-                'EE BESS cha': [pulp.value(bess_cha[t]) for t in range(T)],
-                'Zisk': profits,
+                'EE BESS dis': [float(pulp.value(bess_dis[t])) for t in range(T)],
+                'EE EK': [float(pulp.value(q_ek[t]) / 0.95) for t in range(T)],
+                'EE BESS cha': [float(pulp.value(bess_cha[t])) for t in range(T)],
+            }
+
+            res = pd.DataFrame(res_data)
+
+            # Zisk po hodinách – teď správně jako float
+            hourly_profit = []
+            for t in range(T):
+                rev = p['h_price'] * res['KGJ'].iloc[t] + p['h_price'] * res['Kotel'].iloc[t] + \
+                      p['h_price'] * res['Elektrokotel'].iloc[t] + p['h_price'] * res['Import tepla'].iloc[t] + \
+                      p['h_price'] * res['TES netto'].iloc[t] + \
+                      (df['ee_price'].iloc[t] - p['dist_ee_sell']) * res['EE export'].iloc[t]
+                
+                cost = (df['gas_price'].iloc[t] + p['gas_dist']) * \
+                       (res['KGJ'].iloc[t]/p['k_eff_th'] + res['Kotel'].iloc[t]/0.95) + \
+                       (df['ee_price'].iloc[t] + p['dist_ee_buy']) * res['EE import'].iloc[t] + \
+                       p['imp_price'] * res['Import tepla'].iloc[t]
+                
+                # Start costs – najdeme, kde byl start
+                start_cost = p['k_start_cost'] * float(pulp.value(start[t])) if t in start else 0.0
+                
+                penalty = p['h_price'] * res['Shortfall'].iloc[t]
+                
+                hourly_profit.append(rev - cost - start_cost - penalty)
+
+            res['Zisk'] = hourly_profit
+
+            # Metriky – teď bezpečně
+            total_profit = sum(hourly_profit)
+            total_shortfall = res['Shortfall'].sum()
+            target_heat = (res['Poptávka tepla'] * p['h_cover']).sum()
+            avg_coverage = (1 - total_shortfall / target_heat) * 100 if target_heat > 0 else 0.0
+            total_ee_export = res['EE export'].sum()
+            total_ee_import = res['EE import'].sum()
+
+            st.subheader("📈 Klíčové metriky")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Celkový zisk [€]", f"{total_profit:,.0f}")
+            col2.metric("Celkový shortfall [MWh]", f"{total_shortfall:,.1f}")
+            col3.metric("Průměrné pokrytí [%]", f"{avg_coverage:.1f}")
+            col4.metric("EE export [MWh]", f"{total_ee_export:,.1f}")
+            col5.metric("EE import [MWh]", f"{total_ee_import:,.1f}")
+
             })
 
             # Klíčové metriky
@@ -327,3 +369,4 @@ if st.session_state.fwd_data is not None and loc_file is not None:
 
 else:
     st.info("Nahrajte prosím FWD křivku a lokální data, abyste mohli spustit optimalizaci.")
+

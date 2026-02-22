@@ -258,10 +258,169 @@ if st.session_state.fwd_data is not None and loc_file is not None:
         st.write(f"Status: {pulp.LpStatus[status]} | Zisk: {pulp.value(model.objective):,.0f} €")
 
         if status == 1:
-            # Zde by měly přijít grafy a tabulka – pokud chceš, přidej je z předchozí verze
-            st.success("Optimalizace dokončena. (Grafy lze přidat stejně jako dříve)")
-        else:
-            st.error("Optimalizace selhala – zkus změnit parametry")
+                        # ────────────────────────────────────────────────
+            # Extrakce výsledků (vše jako float)
+            # ────────────────────────────────────────────────
+            res = pd.DataFrame({
+                'Čas': df['datetime'],
+                'Poptávka tepla [MW]': df['Poptávka po teple (MW)'],
+                'Dodáno tepla [MW]': [float(pulp.value(heat_delivered[t])) for t in range(T)],
+                'Shortfall [MW]': [float(pulp.value(heat_shortfall[t])) for t in range(T)],
+                'KGJ [MW_th]': [float(pulp.value(q_kgj[t])) for t in range(T)],
+                'Kotel [MW_th]': [float(pulp.value(q_boil[t])) for t in range(T)],
+                'Elektrokotel [MW_th]': [float(pulp.value(q_ek[t])) for t in range(T)],
+                'Import tepla [MW_th]': [float(pulp.value(q_imp[t])) for t in range(T)],
+                'TES netto [MW_th]': [float(pulp.value(tes_out[t]) - pulp.value(tes_in[t])) for t in range(T)],
+                'TES SOC [MWh]': [float(pulp.value(tes_soc[t+1])) for t in range(T)],
+                'BESS SOC [MWh]': [float(pulp.value(bess_soc[t+1])) for t in range(T)],
+                'EE export [MW]': [float(pulp.value(ee_export[t])) for t in range(T)],
+                'EE import [MW]': [float(pulp.value(ee_import[t])) for t in range(T)],
+                'EE z KGJ [MW]': [float(pulp.value(q_kgj[t]) * (p['k_el'] / p['k_th'])) if use_kgj else 0.0 for t in range(T)],
+                'EE z FVE [MW]': [float(df['FVE (MW)'].iloc[t]) if use_fve and 'FVE (MW)' in df.columns else 0.0 for t in range(T)],
+                'EE do BESS [MW]': [float(pulp.value(bess_cha[t])) for t in range(T)],
+                'EE z BESS [MW]': [float(pulp.value(bess_dis[t])) for t in range(T)],
+                'EE do EK [MW]': [float(pulp.value(q_ek[t]) / 0.95) for t in range(T)],
+            })
 
-else:
-    st.info("Nahraj FWD křivku a lokální data pro spuštění.")
+            # Hodinový zisk (pro kumulativní graf a kontrolu)
+            hourly_profit = []
+            for t in range(T):
+                rev = p['h_price'] * res['Dodáno tepla [MW]'].iloc[t] + \
+                      (df['ee_price'].iloc[t] - p['dist_ee_sell']) * res['EE export [MW]'].iloc[t]
+
+                cost_gas = (df['gas_price'].iloc[t] + p['gas_dist']) * \
+                           (res['KGJ [MW_th]'].iloc[t] / p['k_eff_th'] + res['Kotel [MW_th]'].iloc[t] / 0.95)
+
+                cost_ee = (df['ee_price'].iloc[t] + p['dist_ee_buy']) * res['EE import [MW]'].iloc[t]
+                cost_imp = p['imp_price'] * res['Import tepla [MW_th]'].iloc[t]
+                cost_start = p['k_start_cost'] * float(pulp.value(start[t]) or 0)
+                penalty = p['h_price'] * res['Shortfall [MW]'].iloc[t]
+
+                hod_zisk = rev - cost_gas - cost_ee - cost_imp - cost_start - penalty
+                hourly_profit.append(hod_zisk)
+
+            res['Hodinový zisk [€]'] = hourly_profit
+
+            # ────────────────────────────────────────────────
+            # Metriky
+            # ────────────────────────────────────────────────
+            total_profit = res['Hodinový zisk [€]'].sum()
+            total_shortfall = res['Shortfall [MW]'].sum()
+            target_heat = (res['Poptávka tepla [MW]'] * p['h_cover']).sum()
+            coverage = 100 * (1 - total_shortfall / target_heat) if target_heat > 0 else 0
+
+            st.subheader("📊 Klíčové metriky")
+            cols = st.columns(5)
+            cols[0].metric("Celkový zisk", f"{total_profit:,.0f} €")
+            cols[1].metric("Shortfall celkem", f"{total_shortfall:,.1f} MWh")
+            cols[2].metric("Pokrytí poptávky", f"{coverage:.1f} %")
+            cols[3].metric("Export EE", f"{res['EE export [MW]'].sum():,.1f} MWh")
+            cols[4].metric("Import EE", f"{res['EE import [MW]'].sum():,.1f} MWh")
+
+            # ────────────────────────────────────────────────
+            # Graf 1 – Pokrytí tepla (stack)
+            # ────────────────────────────────────────────────
+            st.subheader("🔥 Pokrytí tepelné poptávky")
+            fig_heat = go.Figure()
+
+            sources = ['KGJ [MW_th]', 'Kotel [MW_th]', 'Elektrokotel [MW_th]', 'Import tepla [MW_th]', 'TES netto [MW_th]']
+            names = ['KGJ', 'Kotel', 'Elektrokotel', 'Import', 'TES netto']
+            colors = ['#27ae60', '#3498db', '#9b59b6', '#e74c3c', '#f39c12']
+
+            for src, name, color in zip(sources, names, colors):
+                fig_heat.add_trace(go.Scatter(
+                    x=res['Čas'], y=res[src],
+                    name=name,
+                    stackgroup='teplo',
+                    fillcolor=color,
+                    line_width=0
+                ))
+
+            fig_heat.add_trace(go.Scatter(
+                x=res['Čas'], y=res['Shortfall [MW]'],
+                name='Nedodáno',
+                stackgroup='teplo',
+                fillcolor='rgba(0,0,0,0.35)'
+            ))
+
+            fig_heat.add_trace(go.Scatter(
+                x=res['Čas'], y=res['Poptávka tepla [MW]'] * p['h_cover'],
+                name='Cílová poptávka',
+                mode='lines',
+                line=dict(color='black', width=2.5, dash='dot')
+            ))
+
+            fig_heat.update_layout(
+                height=520,
+                hovermode='x unified',
+                title="Složení tepelné dodávky v čase"
+            )
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+            # ────────────────────────────────────────────────
+            # Graf 2 – Bilance elektřiny
+            # ────────────────────────────────────────────────
+            st.subheader("⚡ Bilance elektřiny")
+            fig_ee = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                   vertical_spacing=0.08,
+                                   row_heights=[0.5, 0.5],
+                                   subplot_titles=("Výroba EE", "Spotřeba / export EE"))
+
+            # Výroba (kladná)
+            for src, name, color in zip(
+                ['EE z KGJ [MW]', 'EE z FVE [MW]', 'EE import [MW]', 'EE z BESS [MW]'],
+                ['KGJ', 'FVE', 'Import EE', 'BESS výdej'],
+                ['#2ecc71', '#f1c40f', '#2980b9', '#8e44ad']
+            ):
+                fig_ee.add_trace(go.Scatter(
+                    x=res['Čas'], y=res[src],
+                    name=name,
+                    stackgroup='vyroba',
+                    fillcolor=color
+                ), row=1, col=1)
+
+            # Spotřeba (záporná)
+            for src, name, color in zip(
+                ['EE do EK [MW]', 'EE do BESS [MW]', 'EE export [MW]'],
+                ['EK', 'BESS nabíjení', 'Export EE'],
+                ['#e74c3c', '#34495e', '#16a085']
+            ):
+                fig_ee.add_trace(go.Scatter(
+                    x=res['Čas'], y=-res[src],
+                    name=name,
+                    stackgroup='spotreba',
+                    fillcolor=color
+                ), row=2, col=1)
+
+            fig_ee.update_layout(height=680, hovermode='x unified')
+            st.plotly_chart(fig_ee, use_container_width=True)
+
+            # ────────────────────────────────────────────────
+            # Graf 3 – Stavy akumulace
+            # ────────────────────────────────────────────────
+            st.subheader("🔋 Stavy akumulátorů")
+            fig_soc = make_subplots(rows=1, cols=2, subplot_titles=("TES SOC", "BESS SOC"))
+            fig_soc.add_trace(go.Scatter(x=res['Čas'], y=res['TES SOC [MWh]'], name='TES SOC', line_color='#e67e22'), row=1, col=1)
+            fig_soc.add_hline(y=p['tes_cap'], line_dash="dot", row=1, col=1)
+            fig_soc.add_trace(go.Scatter(x=res['Čas'], y=res['BESS SOC [MWh]'], name='BESS SOC', line_color='#3498db'), row=1, col=2)
+            fig_soc.add_hline(y=p['bess_cap'], line_dash="dot", row=1, col=2)
+            fig_soc.update_layout(height=420)
+            st.plotly_chart(fig_soc, use_container_width=True)
+
+            # ────────────────────────────────────────────────
+            # Graf 4 – Kumulativní zisk
+            # ────────────────────────────────────────────────
+            st.subheader("💰 Kumulativní zisk")
+            res['Kumulativní zisk [€]'] = res['Hodinový zisk [€]'].cumsum()
+            fig_cum = go.Figure()
+            fig_cum.add_trace(go.Scatter(
+                x=res['Čas'], y=res['Kumulativní zisk [€]'],
+                fill='tozeroy', fillcolor='rgba(39,174,96,0.3)',
+                line_color='#27ae60'
+            ))
+            fig_cum.update_layout(height=420, title="Průběh kumulativního zisku")
+            st.plotly_chart(fig_cum, use_container_width=True)
+
+            # Tabulka na kontrolu
+            st.subheader("Detail (prvních 48 hodin)")
+            st.dataframe(res.head(48).round(3), use_container_width=True)

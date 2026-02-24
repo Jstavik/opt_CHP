@@ -861,6 +861,39 @@ if st.session_state.results is not None and st.session_state.df_main is not None
         ee_lbls  = [f"{st.session_state.ee_new+d:.0f}"  for d in ee_deltas]
         gas_lbls = [f"{st.session_state.gas_new+d:.0f}" for d in gas_deltas]
 
+        # Tornado cena tepla
+        prog.progress(sa_steps**2/total_runs, text="Tornado cena tepla…")
+        tornado = []
+        for hi, hp in enumerate(h_prices):
+            run_i += 1
+            prog.progress(run_i/total_runs, text=f"Teplo run {hi+1}/{sa_h_steps} | {hp:.0f} €/MWh")
+            r = run_optimization(df, p, uses, h_price_override=hp, time_limit=sa_tl)
+            if r:
+                tornado.append({'cena_tepla': hp, 'zisk': r['total_profit']})
+        prog.progress(1.0, text="Hotovo ✔")
+
+        # Uložit vše do session_state – grafy se vykreslí níže mimo button blok
+        st.session_state['sa_profit_mx']   = profit_mx
+        st.session_state['sa_kgj_mx']      = kgj_mx
+        st.session_state['sa_ee_lbls']     = ee_lbls
+        st.session_state['sa_gas_lbls']    = gas_lbls
+        st.session_state['sa_tornado']     = tornado
+        st.session_state['sa_base_profit'] = total_profit
+        st.session_state['sa_steps_done']  = sa_steps
+        st.session_state['sa_use_kgj']     = use_kgj
+
+    # ── Vykreslení výsledků citlivosti (perzistentní – mimo button blok) ──
+    if st.session_state.get('sa_profit_mx') is not None:
+        profit_mx  = st.session_state['sa_profit_mx']
+        kgj_mx     = st.session_state['sa_kgj_mx']
+        ee_lbls    = st.session_state['sa_ee_lbls']
+        gas_lbls   = st.session_state['sa_gas_lbls']
+        tornado    = st.session_state['sa_tornado']
+        base_profit= st.session_state.get('sa_base_profit', total_profit)
+        n_steps    = st.session_state.get('sa_steps_done', 5)
+        sa_use_kgj = st.session_state.get('sa_use_kgj', use_kgj)
+
+        st.markdown("#### Spark spread – výsledky")
         fig = make_subplots(rows=1, cols=2,
             subplot_titles=("Celkový zisk [tis. €]", "Provozní hodiny KGJ [h]"),
             horizontal_spacing=0.12)
@@ -878,46 +911,32 @@ if st.session_state.results is not None and st.session_state.df_main is not None
             texttemplate="%{text}", textfont=dict(size=11),
             hovertemplate="EE: %{x} €/MWh<br>Plyn: %{y} €/MWh<br>KGJ h: %{z:.0f}<extra></extra>"),
             row=1, col=2)
+        mid = n_steps // 2
         for c in [1, 2]:
             fig.add_trace(go.Scatter(
-                x=[ee_lbls[sa_steps//2]], y=[gas_lbls[sa_steps//2]],
+                x=[ee_lbls[mid]], y=[gas_lbls[mid]],
                 mode='markers', marker=dict(symbol='star', size=18, color='black'),
-                name='Základní scénář', showlegend=(c==1)), row=1, col=c)
+                name='Základní scénář', showlegend=(c == 1)), row=1, col=c)
         fig.update_xaxes(title_text="Cena EE [€/MWh]")
         fig.update_yaxes(title_text="Cena plynu [€/MWh]")
         fig.update_layout(height=520, title="Spark spread analýza")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Tornado cena tepla
-        prog.progress(sa_steps**2/total_runs, text="Tornado cena tepla…")
-        tornado = []
-        for hi, hp in enumerate(h_prices):
-            run_i += 1
-            prog.progress(run_i/total_runs, text=f"Teplo run {hi+1}/{sa_h_steps} | {hp:.0f} €/MWh")
-            r = run_optimization(df, p, uses, h_price_override=hp, time_limit=sa_tl)
-            if r:
-                tornado.append({'cena_tepla': hp, 'zisk': r['total_profit']})
-        prog.progress(1.0, text="Hotovo ✔")
-
         if tornado:
+            st.markdown("#### Citlivost zisku na cenu tepla")
             df_tor = pd.DataFrame(tornado)
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df_tor['cena_tepla'], y=df_tor['zisk']/1000,
-                mode='lines+markers', line=dict(color='#3498db', width=2), marker=dict(size=8)))
-            fig.add_hline(y=total_profit/1000, line_dash="dot", line_color='#27ae60',
-                annotation_text=f"Základ {total_profit/1000:.0f} tis. €")
+                mode='lines+markers', line=dict(color='#3498db', width=2), marker=dict(size=8),
+                hovertemplate="Cena tepla: %{x:.0f} €/MWh<br>Zisk: %{y:.0f} tis. €<extra></extra>"))
+            fig.add_hline(y=base_profit/1000, line_dash="dot", line_color='#27ae60',
+                annotation_text=f"Základ {base_profit/1000:.0f} tis. €")
             fig.add_hline(y=0, line_dash="dash", line_color='#e74c3c',
                 annotation_text="Break-even")
             fig.update_layout(height=400, xaxis_title='Cena tepla [€/MWh]',
                 yaxis_title='Celkový zisk [tis. €]',
                 title='Citlivost zisku na cenu tepla', hovermode='x unified')
             st.plotly_chart(fig, use_container_width=True)
-
-        st.session_state['sa_profit_mx'] = profit_mx
-        st.session_state['sa_kgj_mx']    = kgj_mx
-        st.session_state['sa_ee_lbls']   = ee_lbls
-        st.session_state['sa_gas_lbls']  = gas_lbls
-        st.session_state['sa_tornado']   = tornado
 
     # ════════════════════════════════════════════
     # EXCEL EXPORT

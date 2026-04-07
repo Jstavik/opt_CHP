@@ -15,6 +15,7 @@ for key, default in [
     ('ee_new', 100.0), ('gas_new', 50.0), ('results', None), ('df_main', None),
     ('scenario_results', None), ('selected_profile', 'free'),
     ('monthly_profile_results', None), ('sensitivity_results', None),
+    ('annual_plan_result', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -104,13 +105,17 @@ def calculate_smoothness_metrics(res):
     # Stabilita skóre (0-100%, méně transakcí = vyšší skóre)
     stability_score = max(0, 100 * (1 - transitions / (len(kgj_on) / 2))) if len(kgj_on) > 0 else 0
     
+    total_on = int(np.sum(kgj_on))
+    utilization_pct = total_on / len(kgj_on) * 100 if len(kgj_on) > 0 else 0
+
     return {
         'transitions': int(transitions),
         'stability_score': stability_score,
         'avg_run_hours': avg_run_length,
         'min_run_hours': min_run_length,
         'max_run_hours': max_run_length,
-        'total_on_hours': int(np.sum(kgj_on)),
+        'total_on_hours': total_on,
+        'utilization_pct': utilization_pct,
     }
 
 
@@ -130,14 +135,163 @@ def create_scenario_comparison_df(scenarios):
         data.append({
             'Profil': profile_name.upper(),
             'Zisk [€]': f"{profit:,.0f}",
-            'Transitions': smooth['transitions'],
+            'Využití KGJ [%]': f"{smooth['utilization_pct']:.1f}",
             'Stabilita [%]': f"{smooth['stability_score']:.1f}",
+            'Transitions': smooth['transitions'],
             'Avg Runtime [h]': f"{smooth['avg_run_hours']:.1f}",
-            'Total Hours': smooth['total_on_hours'],
+            'Total Hours ON': smooth['total_on_hours'],
             'Shortfall [MWh]': f"{shortfall:.1f}",
         })
     
     return pd.DataFrame(data)
+
+
+# ────────────────────────────────────────────────
+# EXCEL EXPORTNÍ FUNKCE
+# ────────────────────────────────────────────────
+
+def _wb_formats(workbook):
+    hdr = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1})
+    num = workbook.add_format({'num_format': '#,##0.00'})
+    txt = workbook.add_format({'num_format': '@'})
+    grn = workbook.add_format({'bold': True, 'bg_color': '#C6EFCE', 'border': 1})
+    return hdr, num, txt, grn
+
+def _write_sheet(writer, df, sheet_name, hdr_fmt, num_fmt, txt_fmt):
+    df.to_excel(writer, index=False, sheet_name=sheet_name)
+    ws = writer.sheets[sheet_name]
+    for col_idx, col_name in enumerate(df.columns):
+        is_num = pd.api.types.is_numeric_dtype(df.iloc[:, col_idx])
+        ws.set_column(col_idx, col_idx, 18, num_fmt if is_num else txt_fmt)
+        ws.write(0, col_idx, col_name, hdr_fmt)
+
+
+def to_excel_scenarios(scenarios):
+    """Excel export pro scenáristickou analýzu."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        workbook = writer.book
+        hdr_fmt, num_fmt, txt_fmt, grn_fmt = _wb_formats(workbook)
+
+        # List: Porovnání scénářů
+        comp_df = create_scenario_comparison_df(scenarios)
+        _write_sheet(writer, comp_df, 'Porovnání scénářů', hdr_fmt, num_fmt, txt_fmt)
+
+        # List: Breakdown příjmů/nákladů
+        bd_rows = []
+        for profile, scenario in scenarios.items():
+            if scenario['result'] is None:
+                continue
+            r = scenario['result']['res']
+            bd_rows.append({
+                'Profil':            profile.upper(),
+                'Rev teplo [k€]':   r['Rev teplo [€]'].sum() / 1000,
+                'Rev EE [k€]':      r['Rev EE [€]'].sum() / 1000,
+                'Nákl plyn [k€]':  -(r['Nákl plyn KGJ [€]'].sum() + r['Nákl plyn kotel [€]'].sum()) / 1000,
+                'Nákl EE [k€]':    -(r['Nákl EE import [€]'].sum() + r['Nákl EE EK [€]'].sum()) / 1000,
+                'Nákl imp tepla [k€]': -(r['Nákl imp tepla [€]'].sum()) / 1000,
+                'Nákl starty+BESS [k€]': -(r['Nákl starty [€]'].sum() + r['Nákl BESS [€]'].sum()) / 1000,
+                'Zisk celkem [k€]': r['Hodinový zisk [€]'].sum() / 1000,
+            })
+        if bd_rows:
+            _write_sheet(writer, pd.DataFrame(bd_rows), 'Breakdown nákladů', hdr_fmt, num_fmt, txt_fmt)
+
+        # Listy s hodinovými daty pro každý profil
+        skip_cols = {'Měsíc', 'Hodina dne', 'KGJ on', 'Kotel on', 'Import tepla on'}
+        for profile, scenario in scenarios.items():
+            if scenario['result'] is None:
+                continue
+            res_df = scenario['result']['res']
+            df_exp = res_df[[c for c in res_df.columns if c not in skip_cols]].round(4)
+            sheet = profile.upper()[:31]
+            _write_sheet(writer, df_exp, sheet, hdr_fmt, num_fmt, txt_fmt)
+
+    return buf.getvalue()
+
+
+def to_excel_monthly(monthly_pr, month_names):
+    """Excel export pro měsíční analýzu profilů."""
+    buf = io.BytesIO()
+    months_sorted  = sorted(monthly_pr.keys())
+    all_profiles   = sorted({pr for m in monthly_pr.values() for pr in m.keys()})
+
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        workbook = writer.book
+        hdr_fmt, num_fmt, txt_fmt, grn_fmt = _wb_formats(workbook)
+
+        # List: Nejlepší profil per měsíc
+        best_rows = []
+        for month in months_sorted:
+            m_data = monthly_pr[month]
+            if not m_data:
+                continue
+            best_pr = max(m_data, key=lambda pr: m_data[pr]['profit'])
+            best_rows.append({
+                'Měsíc':           month_names.get(month, month),
+                'Nejlepší profil': best_pr.upper(),
+                'Zisk [€]':        round(m_data[best_pr]['profit'], 0),
+                'Zisk/hod [€]':    round(m_data[best_pr]['profit_per_h'], 2),
+                'Využití KGJ [%]': round(m_data[best_pr]['smoothness']['utilization_pct'], 1),
+                'Stabilita [%]':   round(m_data[best_pr]['smoothness']['stability_score'], 1),
+            })
+        if best_rows:
+            _write_sheet(writer, pd.DataFrame(best_rows), 'Nejlepší profil / měsíc', hdr_fmt, num_fmt, txt_fmt)
+
+        # List: Matice zisk [€] – měsíce × profily
+        matrix_profit = []
+        for month in months_sorted:
+            row = {'Měsíc': month_names.get(month, month)}
+            for pr in all_profiles:
+                row[pr.upper()] = round(monthly_pr[month].get(pr, {}).get('profit', None) or 0, 0)
+            matrix_profit.append(row)
+        df_matrix = pd.DataFrame(matrix_profit)
+        _write_sheet(writer, df_matrix, 'Matice zisk [€]', hdr_fmt, num_fmt, txt_fmt)
+
+        # Podmíněné formátování – zelená = max v řádku
+        ws = writer.sheets['Matice zisk [€]']
+        n_prof = len(all_profiles)
+        if n_prof > 0:
+            ws.conditional_format(1, 1, len(months_sorted), n_prof, {
+                'type': 'cell', 'criteria': '>=',
+                'value': 0, 'format': workbook.add_format({'bg_color': '#C6EFCE'})
+            })
+
+        # List: Matice zisk/hod [€/h]
+        matrix_pph = []
+        for month in months_sorted:
+            row = {'Měsíc': month_names.get(month, month)}
+            for pr in all_profiles:
+                row[pr.upper()] = round(monthly_pr[month].get(pr, {}).get('profit_per_h', None) or 0, 2)
+            matrix_pph.append(row)
+        _write_sheet(writer, pd.DataFrame(matrix_pph), 'Matice zisk_hod [€/h]', hdr_fmt, num_fmt, txt_fmt)
+
+    return buf.getvalue()
+
+
+def to_excel_sensitivity(sa_df, profile_name, gas_range, ee_range, steps):
+    """Excel export pro citlivostní analýzu."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        workbook = writer.book
+        hdr_fmt, num_fmt, txt_fmt, _ = _wb_formats(workbook)
+
+        # List: Data
+        export_df = sa_df[['typ', 'delta', 'profit', 'delta_pct']].rename(columns={
+            'typ': 'Parametr', 'delta': 'Δ cena [€/MWh]',
+            'profit': 'Zisk [€]', 'delta_pct': 'Změna [%]'
+        }).round(2)
+        _write_sheet(writer, export_df, 'Citlivostní analýza', hdr_fmt, num_fmt, txt_fmt)
+
+        # List: Parametry analýzy
+        meta_df = pd.DataFrame([
+            {'Parametr': 'Profil', 'Hodnota': profile_name.upper()},
+            {'Parametr': 'Rozsah plyn [±€/MWh]', 'Hodnota': gas_range},
+            {'Parametr': 'Rozsah EE [±€/MWh]', 'Hodnota': ee_range},
+            {'Parametr': 'Počet kroků', 'Hodnota': steps},
+        ])
+        _write_sheet(writer, meta_df, 'Parametry analýzy', hdr_fmt, num_fmt, txt_fmt)
+
+    return buf.getvalue()
 
 
 # ────────────────────────────────────────────────
@@ -983,6 +1137,7 @@ if st.session_state.fwd_data is not None and loc_file is not None:
                 st.session_state.monthly_profile_results = monthly_res
                 st.session_state.results = None
                 st.session_state.scenario_results = None
+                st.session_state.annual_plan_result = None
                 st.success("✅ Měsíční analýza dokončena!")
 
     with col_mode_2:
@@ -1015,7 +1170,7 @@ if st.session_state.monthly_profile_results is not None:
         m_data = monthly_pr[month]
         if not m_data:
             continue
-        best_pr = max(m_data, key=lambda pr: m_data[pr]['profit_per_h'])
+        best_pr = max(m_data, key=lambda pr: m_data[pr]['profit'])
         best_rows.append({
             'Měsíc':           MONTH_NAMES.get(month, month),
             'Nejlepší profil': best_pr.upper(),
@@ -1050,6 +1205,99 @@ if st.session_state.monthly_profile_results is not None:
         xaxis_title="Měsíc", yaxis_title="Profil"
     )
     st.plotly_chart(fig_heat, use_container_width=True)
+
+    # ── Download měsíční analýzy ──
+    xlsx_monthly = to_excel_monthly(monthly_pr, MONTH_NAMES)
+    st.download_button(
+        label="📥 Stáhnout měsíční analýzu (Excel)",
+        data=xlsx_monthly,
+        file_name="kgj_mesicni_analyza.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_monthly"
+    )
+
+    # ── R2: Kombinovaný roční plán ──
+    st.divider()
+    st.subheader("📋 Kombinovaný roční plán (nejlepší profil / měsíc)")
+    if st.button("📋 Sestavit roční plán", key="btn_annual_plan"):
+        with st.spinner("⏳ Sestavuji roční plán …"):
+            df_annual_src = st.session_state.df_main
+            combined_frames = []
+            months_plan = sorted(monthly_pr.keys())
+            prog_annual = st.progress(0)
+            for idx, month in enumerate(months_plan):
+                m_data = monthly_pr[month]
+                if not m_data:
+                    continue
+                best_pr = max(m_data, key=lambda pr: m_data[pr]['profit'])
+                mask = pd.to_datetime(df_annual_src['datetime']).dt.month == month
+                r = run_optimization_with_profile(
+                    df=df_annual_src, params=p, uses=uses,
+                    profile_type=best_pr,
+                    custom_hours=custom_hours if best_pr == 'custom' else None,
+                    period_mask=mask
+                )
+                if r is not None:
+                    frame = r['res'].copy()
+                    frame['_best_profile'] = best_pr.upper()
+                    combined_frames.append(frame)
+                prog_annual.progress((idx + 1) / len(months_plan))
+            prog_annual.empty()
+            if combined_frames:
+                res_annual = pd.concat(combined_frames, ignore_index=True)
+                st.session_state['annual_plan_result'] = res_annual
+                st.success(f"✅ Roční plán sestaven – {len(res_annual):,} hodin, zisk: {res_annual['Hodinový zisk [€]'].sum():,.0f} €")
+            else:
+                st.error("❌ Nepodařilo se sestavit roční plán.")
+
+    if st.session_state.get('annual_plan_result') is not None:
+        res_ap = st.session_state['annual_plan_result']
+        total_ap = res_ap['Hodinový zisk [€]'].sum()
+        st.info(f"Celkový zisk kombinovaného plánu: **{total_ap:,.0f} €**")
+
+        # Graf – tepelné pokrytí
+        st.markdown("#### 🔥 Pokrytí tepelné poptávky (kombinovaný plán)")
+        fig_ap = go.Figure()
+        for col, name, color in [
+            ('KGJ [MW_th]',          'KGJ',         '#27ae60'),
+            ('Kotel [MW_th]',        'Kotel',        '#3498db'),
+            ('Elektrokotel [MW_th]', 'Elektrokotel', '#9b59b6'),
+            ('Import tepla [MW_th]', 'Import tepla', '#e74c3c'),
+        ]:
+            if col in res_ap.columns:
+                fig_ap.add_trace(go.Scatter(x=res_ap['Čas'], y=res_ap[col].clip(lower=0),
+                    name=name, stackgroup='teplo', fillcolor=color, line_width=0))
+        fig_ap.add_trace(go.Scatter(x=res_ap['Čas'], y=res_ap['Poptávka tepla [MW]'] * p['h_cover'],
+            name='Cílová poptávka', mode='lines', line=dict(color='black', width=2, dash='dot')))
+        fig_ap.update_layout(height=420, hovermode='x unified')
+        st.plotly_chart(fig_ap, use_container_width=True)
+
+        # Graf – kumulativní zisk
+        st.markdown("#### 💰 Kumulativní zisk (kombinovaný plán)")
+        fig_ap2 = go.Figure()
+        fig_ap2.add_trace(go.Scatter(
+            x=res_ap['Čas'], y=res_ap['Hodinový zisk [€]'].cumsum(),
+            fill='tozeroy', fillcolor='rgba(39,174,96,0.2)',
+            line_color='#27ae60', name='Kum. zisk'
+        ))
+        fig_ap2.update_layout(height=300, hovermode='x unified')
+        st.plotly_chart(fig_ap2, use_container_width=True)
+
+        # Download kombinovaného plánu
+        skip_cols_ap = {'Měsíc', 'Hodina dne', 'KGJ on', 'Kotel on', 'Import tepla on'}
+        df_ap_exp = res_ap[[c for c in res_ap.columns if c not in skip_cols_ap]].round(4)
+        buf_ap = io.BytesIO()
+        with pd.ExcelWriter(buf_ap, engine='xlsxwriter') as writer_ap:
+            workbook_ap = writer_ap.book
+            hdr_ap, num_ap, txt_ap, _ = _wb_formats(workbook_ap)
+            _write_sheet(writer_ap, df_ap_exp, 'Kombinovaný plán', hdr_ap, num_ap, txt_ap)
+        st.download_button(
+            label="📥 Stáhnout kombinovaný roční plán (Excel)",
+            data=buf_ap.getvalue(),
+            file_name="kgj_rocni_plan.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_annual_plan"
+        )
 
 
 # ────────────────────────────────────────────────
@@ -1144,7 +1392,45 @@ if st.session_state.scenario_results is not None:
                 hovermode='x unified'
             )
             st.plotly_chart(fig2, use_container_width=True)
-    
+
+    # ── Breakdown příjmů a nákladů ──
+    st.markdown("**Breakdown příjmů a nákladů dle profilu**")
+    breakdown_data = []
+    for profile, scenario in scenarios.items():
+        if scenario['result'] is None:
+            continue
+        r = scenario['result']['res']
+        breakdown_data.append({
+            'Profil':           profile.upper(),
+            'Rev teplo':        r['Rev teplo [€]'].sum() / 1000,
+            'Rev EE':           r['Rev EE [€]'].sum() / 1000,
+            'Nákl plyn':       -(r['Nákl plyn KGJ [€]'].sum() + r['Nákl plyn kotel [€]'].sum()) / 1000,
+            'Nákl EE':         -(r['Nákl EE import [€]'].sum() + r['Nákl EE EK [€]'].sum()) / 1000,
+            'Nákl imp tepla':  -(r['Nákl imp tepla [€]'].sum()) / 1000,
+            'Nákl starty/BESS':-(r['Nákl starty [€]'].sum() + r['Nákl BESS [€]'].sum()) / 1000,
+        })
+
+    if breakdown_data:
+        df_bd = pd.DataFrame(breakdown_data)
+        fig_bd = go.Figure()
+        colors_pos = ['#27ae60', '#2ecc71']
+        colors_neg = ['#e74c3c', '#c0392b', '#e67e22', '#95a5a6']
+        pos_cols = ['Rev teplo', 'Rev EE']
+        neg_cols = ['Nákl plyn', 'Nákl EE', 'Nákl imp tepla', 'Nákl starty/BESS']
+        for col, color in zip(pos_cols, colors_pos):
+            fig_bd.add_trace(go.Bar(name=col, x=df_bd['Profil'], y=df_bd[col],
+                                    marker_color=color))
+        for col, color in zip(neg_cols, colors_neg):
+            fig_bd.add_trace(go.Bar(name=col, x=df_bd['Profil'], y=df_bd[col],
+                                    marker_color=color))
+        fig_bd.update_layout(
+            barmode='relative', height=420,
+            title="Příjmy (kladné) a náklady (záporné) dle profilu [k€]",
+            yaxis_title="k€", hovermode='x unified',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02)
+        )
+        st.plotly_chart(fig_bd, use_container_width=True)
+
     # ── Detailní view vybraného profilu ──
     st.divider()
     st.subheader(f"🔍 Detailní Analýza: {st.session_state.selected_profile.upper()}")
@@ -1156,37 +1442,44 @@ if st.session_state.scenario_results is not None:
         smoothness = selected_scenario['smoothness']
         
         # Smoothness Metrics Box
-        col_sm_1, col_sm_2, col_sm_3, col_sm_4, col_sm_5 = st.columns(5)
-        
+        col_sm_1, col_sm_2, col_sm_3, col_sm_4, col_sm_5, col_sm_6 = st.columns(6)
+
         with col_sm_1:
             st.metric(
-                "Přechodů ON↔OFF",
-                f"{smoothness['transitions']}",
-                help="Počet start-stop cyklů (méně = lépe)"
+                "Využití KGJ",
+                f"{smoothness['utilization_pct']:.1f}%",
+                help="Podíl hodin, kdy KGJ skutečně běželo (z celkového období)"
             )
-        
+
         with col_sm_2:
             st.metric(
                 "Stabilita Skóre",
                 f"{smoothness['stability_score']:.1f}%",
                 help="0-100% (100% = velmi hladký provoz)"
             )
-        
+
         with col_sm_3:
+            st.metric(
+                "Přechodů ON↔OFF",
+                f"{smoothness['transitions']}",
+                help="Počet start-stop cyklů (méně = lépe)"
+            )
+
+        with col_sm_4:
             st.metric(
                 "Avg Runtime",
                 f"{smoothness['avg_run_hours']:.1f} h",
                 help="Průměrná délka provozu"
             )
-        
-        with col_sm_4:
+
+        with col_sm_5:
             st.metric(
                 "Min Runtime",
                 f"{smoothness['min_run_hours']:.0f} h",
                 help="Nejkratší běh"
             )
-        
-        with col_sm_5:
+
+        with col_sm_6:
             st.metric(
                 "Max Runtime",
                 f"{smoothness['max_run_hours']:.0f} h",
@@ -1275,6 +1568,17 @@ if st.session_state.scenario_results is not None:
             fill='tozeroy', fillcolor='rgba(39,174,96,0.2)', line_color='#27ae60', name='Kum. zisk'))
         fig.update_layout(height=350, hovermode='x unified')
         st.plotly_chart(fig, use_container_width=True)
+
+    # ── Download scénářů ──
+    st.divider()
+    xlsx_scen = to_excel_scenarios(scenarios)
+    st.download_button(
+        label="📥 Stáhnout scénáře (Excel)",
+        data=xlsx_scen,
+        file_name="kgj_scenare.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_scenarios"
+    )
 
 # ────────────────────────────────────────────────
 # SINGLE RESULT VIEW (když není scenario mode)
@@ -1468,13 +1772,14 @@ if st.session_state.results is not None and st.session_state.scenario_results is
             if scenario_comparison_df is not None:
                 scenario_comparison_df.to_excel(writer, index=False, sheet_name='Scénáře')
 
-            # xlsxwriter formátování – tučné hlavičky a šířky sloupců
+            # xlsxwriter formátování – tučné hlavičky, šířky sloupců, číselný formát
             workbook  = writer.book
             hdr_fmt   = workbook.add_format({
                 'bold': True, 'bg_color': '#D9E1F2',
                 'border': 1, 'text_wrap': False
             })
             num_fmt   = workbook.add_format({'num_format': '#,##0.00'})
+            txt_fmt   = workbook.add_format({'num_format': '@'})
             for sheet_name, df_sheet in [
                 ('Hodinová data',  df_exp),
                 ('Měsíční souhrn', monthly_df),
@@ -1482,8 +1787,11 @@ if st.session_state.results is not None and st.session_state.scenario_results is
                 ('Parametry',      params_df),
             ] + ([('Scénáře', scenario_comparison_df)] if scenario_comparison_df is not None else []):
                 ws = writer.sheets[sheet_name]
-                ws.set_column(0, max(len(df_sheet.columns) - 1, 0), 18)
                 for col_idx, col_name in enumerate(df_sheet.columns):
+                    col_data = df_sheet.iloc[:, col_idx]
+                    is_num = pd.api.types.is_numeric_dtype(col_data)
+                    col_fmt = num_fmt if is_num else txt_fmt
+                    ws.set_column(col_idx, col_idx, 18, col_fmt)
                     ws.write(0, col_idx, col_name, hdr_fmt)
 
         return buf.getvalue()
@@ -1505,27 +1813,28 @@ if st.session_state.results is not None and st.session_state.scenario_results is
     st.subheader("📊 Citlivostní analýza")
     st.markdown("Zobrazí, jak se změní zisk při změně tržní ceny plynu nebo elektřiny.")
 
-    with st.expander("⚙️ Nastavení citlivostní analýzy", expanded=False):
-        col_sa1, col_sa2, col_sa3 = st.columns(3)
-        with col_sa1:
-            sa_gas_range = st.slider("Rozsah ceny plynu [±€/MWh]", 5, 50, 20, step=5,
-                                     key="sa_gas_range")
-        with col_sa2:
-            sa_ee_range  = st.slider("Rozsah ceny EE [±€/MWh]",    5, 50, 20, step=5,
-                                     key="sa_ee_range")
-        with col_sa3:
-            sa_steps     = st.selectbox("Počet kroků:", [3, 5, 7, 9], index=1, key="sa_steps")
+    col_sa1, col_sa2, col_sa3 = st.columns(3)
+    with col_sa1:
+        sa_gas_range = st.slider("Rozsah ceny plynu [±€/MWh]", 5, 50, 20, step=5,
+                                 key="sa_gas_range")
+    with col_sa2:
+        sa_ee_range  = st.slider("Rozsah ceny EE [±€/MWh]", 5, 50, 20, step=5,
+                                 key="sa_ee_range")
+    with col_sa3:
+        sa_steps = st.selectbox("Počet kroků:", [3, 5, 7, 9], index=1, key="sa_steps")
 
-        # Výběr profilu pro citlivostní analýzu
+    # Výběr profilu – zahrnuje single result i scénáře
+    available_profiles = ['free']
+    if st.session_state.scenario_results:
+        available_profiles = list(st.session_state.scenario_results.keys())
+    elif st.session_state.results:
         available_profiles = ['free']
-        if st.session_state.scenario_results:
-            available_profiles = list(st.session_state.scenario_results.keys())
-        sa_profile = st.selectbox(
-            "Profil pro analýzu:",
-            options=available_profiles,
-            format_func=lambda x: x.upper(),
-            key="sa_profile"
-        )
+    sa_profile = st.selectbox(
+        "Profil pro analýzu:",
+        options=available_profiles,
+        format_func=lambda x: x.upper(),
+        key="sa_profile"
+    )
 
     if st.button("📊 Spustit citlivostní analýzu", key="btn_sensitivity"):
         with st.spinner("⏳ Probíhá citlivostní analýza …"):
@@ -1578,4 +1887,20 @@ if st.session_state.results is not None and st.session_state.scenario_results is
                 'profit': 'Zisk [€]', 'delta_pct': 'Změna [%]'
             }).round(2),
             use_container_width=True, hide_index=True
+        )
+
+        # Download citlivostní analýzy
+        xlsx_sa = to_excel_sensitivity(
+            sa_df=sa_df,
+            profile_name=sa_profile,
+            gas_range=sa_gas_range,
+            ee_range=sa_ee_range,
+            steps=sa_steps
+        )
+        st.download_button(
+            label="📥 Stáhnout citlivostní analýzu (Excel)",
+            data=xlsx_sa,
+            file_name="kgj_citlivostni_analyza.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_sensitivity"
         )

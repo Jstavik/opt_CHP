@@ -9,6 +9,52 @@ from datetime import datetime, timedelta
 
 st.set_page_config(page_title="KGJ Strategy Expert PRO", layout="wide")
 
+# ── Barvy profilů (konzistentní napříč všemi grafy) ──────────────────
+PROFILE_COLORS = {
+    'free':    '#2196F3',  # modrá
+    'base':    '#4CAF50',  # zelená
+    'peak':    '#FF9800',  # oranžová
+    'extpeak': '#F44336',  # červená
+    'offpeak': '#9C27B0',  # fialová
+    'custom':  '#607D8B',  # šedá
+}
+
+# ── CSS – vizuální vylepšení ──────────────────────────────────────────
+st.markdown("""
+<style>
+/* KPI karty */
+div[data-testid="metric-container"] {
+    background: linear-gradient(135deg, #1e2a3a 0%, #243447 100%);
+    border: 1px solid #2d4a6b;
+    border-radius: 12px;
+    padding: 16px 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+div[data-testid="metric-container"] label {
+    color: #8ab4d4 !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+div[data-testid="metric-container"] [data-testid="stMetricValue"] {
+    color: #ffffff !important;
+    font-size: 1.6rem !important;
+    font-weight: 700 !important;
+}
+div[data-testid="metric-container"] [data-testid="stMetricDelta"] {
+    font-size: 0.8rem !important;
+}
+/* Sekce nadpisy */
+h3 { color: #e8f4fd; }
+/* Sidebar */
+section[data-testid="stSidebar"] { background: #0f1923; }
+section[data-testid="stSidebar"] label { color: #c5d8ea !important; }
+section[data-testid="stSidebar"] .stMarkdown h2,
+section[data-testid="stSidebar"] .stMarkdown h3 { color: #4fc3f7 !important; }
+</style>
+""", unsafe_allow_html=True)
+
 # ── Session state ────────────────────────────────
 for key, default in [
     ('fwd_data', None), ('avg_ee_raw', 100.0), ('avg_gas_raw', 50.0),
@@ -1426,6 +1472,35 @@ if st.session_state.monthly_profile_results is not None:
         total_ap = res_ap['Hodinový zisk [€]'].sum()
         st.info(f"Celkový zisk kombinovaného plánu: **{total_ap:,.0f} €**")
 
+        # ── Barevný kalendář ročního plánu ───────────────────────────
+        if '_best_profile' in res_ap.columns:
+            st.markdown("#### 📅 Profil per měsíc")
+            res_ap['_month'] = pd.to_datetime(res_ap['Čas']).dt.month
+            month_summary = (
+                res_ap.groupby('_month')
+                .agg(profil=('_best_profile', 'first'),
+                     zisk=('Hodinový zisk [€]', 'sum'),
+                     hodiny_kgj=('KGJ on', 'sum'))
+                .reset_index()
+            )
+            MONTH_LABELS = {1:'Led',2:'Úno',3:'Bře',4:'Dub',5:'Kvě',6:'Čvn',
+                            7:'Čvc',8:'Srp',9:'Zář',10:'Říj',11:'Lis',12:'Pro'}
+            cal_cols = st.columns(12)
+            for _, mrow in month_summary.iterrows():
+                m = int(mrow['_month'])
+                pr = mrow['profil'].lower()
+                color = PROFILE_COLORS.get(pr, '#888')
+                zisk_k = mrow['zisk'] / 1000
+                cal_cols[m - 1].markdown(
+                    f"""<div style="background:{color};border-radius:10px;padding:10px 4px;
+                    text-align:center;margin:2px;">
+                    <div style="color:white;font-weight:700;font-size:0.85rem">{MONTH_LABELS[m]}</div>
+                    <div style="color:white;font-size:0.7rem;opacity:0.9">{mrow['profil']}</div>
+                    <div style="color:white;font-size:0.75rem;font-weight:600">{zisk_k:+.1f} k€</div>
+                    </div>""",
+                    unsafe_allow_html=True
+                )
+
         # Graf – tepelné pokrytí
         st.markdown("#### 🔥 Pokrytí tepelné poptávky (kombinovaný plán)")
         fig_ap = go.Figure()
@@ -1476,10 +1551,35 @@ if st.session_state.monthly_profile_results is not None:
 # ────────────────────────────────────────────────
 if st.session_state.scenario_results is not None:
     scenarios = st.session_state.scenario_results
-    
+
     st.divider()
     st.subheader("📋 Porovnání Scénářů (Scenario Comparison)")
-    
+
+    # ── KPI karty – vítěz a přehled ──────────────────────────────────
+    valid_scenarios = {k: v for k, v in scenarios.items() if v['result'] is not None}
+    if valid_scenarios:
+        best_profile = max(valid_scenarios, key=lambda k: valid_scenarios[k]['result']['total_profit'])
+        worst_profile = min(valid_scenarios, key=lambda k: valid_scenarios[k]['result']['total_profit'])
+        best_profit = valid_scenarios[best_profile]['result']['total_profit']
+        worst_profit = valid_scenarios[worst_profile]['result']['total_profit']
+        profit_spread = best_profit - worst_profit
+        best_util = valid_scenarios[best_profile]['smoothness']['utilization_pct']
+        best_stab = valid_scenarios[best_profile]['smoothness']['stability_score']
+
+        kpi_cols = st.columns(4)
+        with kpi_cols[0]:
+            st.metric("Nejlepší profil", best_profile.upper(),
+                      f"zisk {best_profit:,.0f} €")
+        with kpi_cols[1]:
+            st.metric("Potenciální zisk navíc", f"{profit_spread:,.0f} €",
+                      f"vs. {worst_profile.upper()}",
+                      delta_color="normal")
+        with kpi_cols[2]:
+            st.metric("Využití KGJ (vítěz)", f"{best_util:.1f} %")
+        with kpi_cols[3]:
+            st.metric("Stabilita (vítěz)", f"{best_stab:.1f} %")
+        st.markdown("")
+
     # Comparison Table
     comparison_df = create_scenario_comparison_df(scenarios)
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
@@ -1502,12 +1602,15 @@ if st.session_state.scenario_results is not None:
         
         if chart_data:
             df_chart = pd.DataFrame(chart_data)
+            bar_colors = [PROFILE_COLORS.get(p.lower(), '#888') for p in df_chart['Profil']]
             fig = go.Figure()
             fig.add_trace(go.Bar(
                 x=df_chart['Profil'],
                 y=df_chart['Zisk [k€]'],
                 name='Zisk [k€]',
-                marker_color='#2ecc71',
+                marker_color=bar_colors,
+                marker_line_color='rgba(255,255,255,0.3)',
+                marker_line_width=1,
                 yaxis='y1'
             ))
             fig.add_trace(go.Scatter(
@@ -1540,12 +1643,16 @@ if st.session_state.scenario_results is not None:
         
         if chart_data2:
             df_chart2 = pd.DataFrame(chart_data2)
+            bar_colors2 = [PROFILE_COLORS.get(p.lower(), '#888') for p in df_chart2['Profil']]
             fig2 = go.Figure()
             fig2.add_trace(go.Bar(
                 x=df_chart2['Profil'],
                 y=df_chart2['Transitions'],
                 name='Přechodů ON↔OFF',
-                marker_color='#e74c3c',
+                marker_color=bar_colors2,
+                marker_line_color='rgba(255,255,255,0.3)',
+                marker_line_width=1,
+                opacity=0.85,
                 yaxis='y1'
             ))
             fig2.add_trace(go.Scatter(
@@ -1601,6 +1708,46 @@ if st.session_state.scenario_results is not None:
             legend=dict(orientation='h', yanchor='bottom', y=1.02)
         )
         st.plotly_chart(fig_bd, use_container_width=True)
+
+    # ── Waterfall – rozkad zisku per profil ──────────────────────────
+    if breakdown_data:
+        st.markdown("**Waterfall – rozkad čistého zisku dle profilu**")
+        wf_cols = st.columns(len(breakdown_data))
+        for col_idx, row in enumerate(breakdown_data):
+            pr_key = row['Profil'].lower()
+            pr_color = PROFILE_COLORS.get(pr_key, '#888')
+            items = {
+                'Teplo': row['Rev teplo'],
+                'Elektřina': row['Rev EE'],
+                'Plyn': row['Nákl plyn'],
+                'EE nákup': row['Nákl EE'],
+                'Imp. teplo': row['Nákl imp tepla'],
+                'Starty/BESS': row['Nákl starty/BESS'],
+            }
+            labels = [''] + list(items.keys()) + ['Zisk']
+            values = [0.0] + list(items.values()) + [0.0]
+            measures = ['absolute'] + ['relative'] * len(items) + ['total']
+            fig_wf = go.Figure(go.Waterfall(
+                orientation='v',
+                measure=measures,
+                x=labels,
+                y=values,
+                connector=dict(line=dict(color='rgba(255,255,255,0.2)', width=1)),
+                increasing=dict(marker_color='#4CAF50'),
+                decreasing=dict(marker_color='#F44336'),
+                totals=dict(marker_color=pr_color),
+                texttemplate='%{y:.1f}',
+                textposition='outside',
+            ))
+            fig_wf.update_layout(
+                height=340,
+                title=dict(text=f"<b>{row['Profil']}</b>", font=dict(color=pr_color, size=14)),
+                yaxis_title="k€",
+                showlegend=False,
+                margin=dict(l=10, r=10, t=50, b=10),
+            )
+            with wf_cols[col_idx]:
+                st.plotly_chart(fig_wf, use_container_width=True)
 
     # ── Detailní view vybraného profilu ──
     st.divider()
@@ -1747,9 +1894,13 @@ if st.session_state.scenario_results is not None:
         st.plotly_chart(fig, use_container_width=True)
         
         st.markdown("#### 💰 Kumulativní Zisk v Čase")
+        _sel_color = PROFILE_COLORS.get(st.session_state.selected_profile, '#27ae60')
+        _fill_rgba = _sel_color.replace('#', '')
+        _r, _g, _b = int(_fill_rgba[0:2], 16), int(_fill_rgba[2:4], 16), int(_fill_rgba[4:6], 16)
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=res['Čas'], y=res['Kumulativní zisk [€]'],
-            fill='tozeroy', fillcolor='rgba(39,174,96,0.2)', line_color='#27ae60', name='Kum. zisk'))
+            fill='tozeroy', fillcolor=f'rgba({_r},{_g},{_b},0.2)',
+            line_color=_sel_color, name='Kum. zisk'))
         fig.update_layout(height=350, hovermode='x unified')
         st.plotly_chart(fig, use_container_width=True)
 

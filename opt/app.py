@@ -31,36 +31,35 @@ MONTH_NAMES = {1:'Led',2:'Úno',3:'Bře',4:'Dub',5:'Kvě',6:'Čvn',
 
 def create_profile_constraints(df, profile_type, custom_hours=None):
     """
-    Vytvoří binary constrainty pro KGJ provoz dle profilu
-    Returns: list[bool] kde True = povoleno běžet, False = musí být OFF
+    Vytvoří constrainty pro KGJ provoz dle profilu.
+    Returns: list[int]  -1 = must OFF, 0 = free, 1 = must ON (baseload)
     """
     df_work = df.copy()
     df_work['hour'] = pd.to_datetime(df_work['datetime']).dt.hour
-    
+
     if profile_type == 'base':
-        # Celý den (0-23)
-        constraints = [True] * len(df_work)
-    
+        # BASE = baseload: KGJ jede 24/7, všechny sloty vynuceny ON
+        constraints = [1] * len(df_work)
+
     elif profile_type == 'peak':
-        # 9-21 (Peak hours)
-        constraints = [h in range(9, 22) for h in df_work['hour']]
-    
+        # Peak hodiny 9-21
+        constraints = [0 if h in range(9, 22) else -1 for h in df_work['hour']]
+
     elif profile_type == 'extpeak':
-        # 6-22 (Extended Peak)
-        constraints = [h in range(6, 23) for h in df_work['hour']]
+        # Extended Peak 6-22
+        constraints = [0 if h in range(6, 23) else -1 for h in df_work['hour']]
 
     elif profile_type == 'offpeak':
-        # Noční hodiny 0-8 a 22-23 (off-peak v českém trhu)
-        constraints = [h <= 8 or h >= 22 for h in df_work['hour']]
+        # Off-peak: noční hodiny 0-8 a 22-23
+        constraints = [0 if (h <= 8 or h >= 22) else -1 for h in df_work['hour']]
 
     elif profile_type == 'custom' and custom_hours:
-        # Custom hours zadané uživatelem
-        constraints = [h in custom_hours for h in df_work['hour']]
-    
+        constraints = [0 if h in custom_hours else -1 for h in df_work['hour']]
+
     else:
-        # 'free' nebo neurčeno = bez omezení
-        constraints = [True] * len(df_work)
-    
+        # 'free' nebo neurčeno = optimizer zcela volný
+        constraints = [0] * len(df_work)
+
     return constraints
 
 
@@ -68,11 +67,11 @@ def apply_profile_constraints_to_model(model, on, constraints, T):
     """Aplikuj profile constrainty do PuLP modelu"""
     if constraints is None:
         return model
-    
     for t in range(T):
-        if not constraints[t]:
-            model += on[t] == 0, f"profile_constraint_{t}"
-    
+        if constraints[t] == -1:
+            model += on[t] == 0, f"profile_off_{t}"
+        elif constraints[t] == 1:
+            model += on[t] == 1, f"profile_on_{t}"
     return model
 
 
@@ -153,6 +152,32 @@ def create_scenario_comparison_df(scenarios):
 # ────────────────────────────────────────────────
 # EXCEL EXPORTNÍ FUNKCE
 # ────────────────────────────────────────────────
+
+def create_detail_comparison_strip(scenarios, p):
+    """Kompaktní porovnávací tabulka všech profilů – stejné metriky jako detail view."""
+    rows = []
+    for name, scenario in scenarios.items():
+        if scenario['result'] is None:
+            continue
+        res    = scenario['result']['res']
+        smooth = scenario['smoothness']
+        profit = scenario['result']['total_profit']
+        shortfall = res['Shortfall [MW]'].sum()
+        target    = (res['Poptávka tepla [MW]'] * p['h_cover']).sum()
+        coverage  = 100.0 * (1 - shortfall / target) if target > 0 else 100.0
+        co2 = res['CO₂ Celkem [tCO₂]'].sum() if 'CO₂ Celkem [tCO₂]' in res.columns else None
+        rows.append({
+            'Profil':           name.upper(),
+            'Zisk [€]':         round(profit, 0),
+            'Pokrytí [%]':      round(coverage, 1),
+            'CO₂ [tCO₂]':       round(co2, 1) if co2 is not None else None,
+            'Přechodů':         smooth['transitions'],
+            'Avg Runtime [h]':  round(smooth['avg_run_hours'], 1),
+            'Stabilita [%]':    round(smooth['stability_score'], 1),
+            'Hod KGJ':          int(res['KGJ on'].sum()),
+        })
+    return pd.DataFrame(rows)
+
 
 def _wb_formats(workbook):
     hdr = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1})
@@ -736,9 +761,11 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
             model += q_kgj[t] <= p['k_th'] * on[t]
             model += q_kgj[t] >= p['k_min'] * p['k_th'] * on[t]
             
-            # PROFILE CONSTRAINT - zakažeme běh mimo dovolené hodiny
-            if not profile_constraints[t]:
+            # PROFILE CONSTRAINT: -1=must off, 0=free, 1=must on (baseload)
+            if profile_constraints[t] == -1:
                 model += on[t] == 0, f"profile_off_{t}"
+            elif profile_constraints[t] == 1:
+                model += on[t] == 1, f"profile_on_{t}"
         
         model += start[0] == on[0]
         for t in range(1, T):
@@ -1050,6 +1077,37 @@ def run_monthly_profile_analysis(df, params, uses, profiles_to_run,
     return results
 
 
+def compute_quarterly_strategy(monthly_pr):
+    """
+    Seskupí měsíce do kvartálů Q1-Q4, najde nejlepší profil per kvartál.
+    Vrátí list[dict]: quarter, best_profile, total_profit, avg_co2
+    """
+    quarters = {
+        'Q1 (Led–Bře)': [1, 2, 3],
+        'Q2 (Dub–Čvn)': [4, 5, 6],
+        'Q3 (Čvc–Zář)': [7, 8, 9],
+        'Q4 (Říj–Pro)': [10, 11, 12],
+    }
+    rows = []
+    for q_label, months in quarters.items():
+        totals, co2_lists = {}, {}
+        for m in months:
+            if m not in monthly_pr:
+                continue
+            for pr, data in monthly_pr[m].items():
+                totals[pr] = totals.get(pr, 0.0) + data['profit']
+                co2v = data.get('total_co2')
+                if co2v is not None:
+                    co2_lists.setdefault(pr, []).append(co2v)
+        if not totals:
+            continue
+        best = max(totals, key=lambda p: totals[p])
+        co2_avg = sum(co2_lists[best]) / len(co2_lists[best]) if co2_lists.get(best) else None
+        rows.append({'quarter': q_label, 'best_profile': best,
+                     'total_profit': totals[best], 'avg_co2': co2_avg})
+    return rows
+
+
 # ────────────────────────────────────────────────
 # CITLIVOSTNÍ ANALÝZA
 # ────────────────────────────────────────────────
@@ -1269,6 +1327,21 @@ if st.session_state.monthly_profile_results is not None:
         xaxis_title="Měsíc", yaxis_title="Profil"
     )
     st.plotly_chart(fig_heat, use_container_width=True)
+
+    # ── Sezónní strategie ──────────────────────────
+    st.divider()
+    st.subheader("🌍 Sezónní strategie (kvartální doporučení)")
+    q_rows = compute_quarterly_strategy(monthly_pr)
+    if q_rows:
+        tbl = [{'Kvartál': r['quarter'],
+                'Nejlepší profil': r['best_profile'].upper(),
+                'Celkový zisk [€]': f"{r['total_profit']:,.0f}",
+                'Průměr CO₂/měsíc [tCO₂]': f"{r['avg_co2']:,.1f}" if r['avg_co2'] is not None else '–'}
+               for r in q_rows]
+        st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
+        narrative = " | ".join(
+            f"{r['quarter'].split()[0]}: **{r['best_profile'].upper()}**" for r in q_rows)
+        st.info(f"Doporučená strategie: {narrative}")
 
     # ── Download měsíční analýzy ──
     xlsx_monthly = to_excel_monthly(monthly_pr, MONTH_NAMES)
@@ -1645,6 +1718,25 @@ if st.session_state.scenario_results is not None:
             fill='tozeroy', fillcolor='rgba(39,174,96,0.2)', line_color='#27ae60', name='Kum. zisk'))
         fig.update_layout(height=350, hovermode='x unified')
         st.plotly_chart(fig, use_container_width=True)
+
+        # ── Compact comparison strip ─────────────────
+        st.markdown("#### 📊 Porovnání všech profilů")
+        strip_df = create_detail_comparison_strip(scenarios, p)
+        if not strip_df.empty:
+            if strip_df['CO₂ [tCO₂]'].isna().all():
+                strip_df = strip_df.drop(columns=['CO₂ [tCO₂]'])
+            selected_upper = st.session_state.selected_profile.upper()
+
+            def _hl_selected(row):
+                color = 'background-color: #d4edda' if row['Profil'] == selected_upper else ''
+                return [color] * len(row)
+
+            fmt = {'Zisk [€]': '{:,.0f}', 'Pokrytí [%]': '{:.1f}',
+                   'Stabilita [%]': '{:.1f}', 'Avg Runtime [h]': '{:.1f}'}
+            styled = (strip_df.style.apply(_hl_selected, axis=1).format(fmt, na_rep='–')
+                      .bar(subset=['Zisk [€]'], color='#2ecc71', vmin=strip_df['Zisk [€]'].min())
+                      .bar(subset=['Stabilita [%]'], color='#3498db', vmin=0, vmax=100))
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # ── Download scénářů ──
     st.divider()

@@ -759,6 +759,7 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
     ee_export      = pulp.LpVariable.dicts("ee_export",  range(T), 0)
     ee_import      = pulp.LpVariable.dicts("ee_import",  range(T), 0)
     heat_shortfall = pulp.LpVariable.dicts("shortfall",  range(T), 0)
+    heat_dump      = pulp.LpVariable.dicts("heat_dump",  range(T), 0)  # přebytečné teplo zahozeno
 
     # ── KGJ provozní omezení ─────────────────────
     if u['kgj']:
@@ -832,7 +833,7 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
 
         heat_delivered = q_kgj[t] + q_boil[t] + q_ek[t] + q_imp[t] + tes_out[t] - tes_in[t]
         model += heat_delivered + heat_shortfall[t] >= h_dem * p['h_cover']
-        model += heat_delivered <= h_dem + 1e-3
+        model += heat_delivered <= h_dem + heat_dump[t] + 1e-3
 
         ee_kgj_out = (c0_el * on[t] + c1_el * q_kgj[t]) if u['kgj'] else 0
         ee_ek_in   = q_ek[t] / ek_eff                            if u['ek']  else 0
@@ -844,7 +845,7 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
         bess_dist_buy_cost  = p['dist_ee_buy']  * bess_cha[t] if (u['bess'] and p.get('bess_dist_buy'))  else 0
         bess_dist_sell_cost = p['dist_ee_sell'] * bess_dis[t] if (u['bess'] and p.get('bess_dist_sell')) else 0
 
-        revenue = (h_price * heat_delivered
+        revenue = (h_price * (heat_delivered - heat_dump[t])
                    + (p_ee_m - dist_sell_net - fve_dist_sell_cost) * ee_export[t])
         co2_price = p.get('co2_price', 0.0)
         co2_cost = 0

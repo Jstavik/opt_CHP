@@ -131,8 +131,9 @@ def create_scenario_comparison_df(scenarios):
         
         profit = scenario['result']['total_profit']
         shortfall = res['Shortfall [MW]'].sum() if 'Shortfall [MW]' in res.columns else 0
-        
-        data.append({
+        co2_total = res['CO₂ Celkem [tCO₂]'].sum() if 'CO₂ Celkem [tCO₂]' in res.columns else None
+
+        row = {
             'Profil': profile_name.upper(),
             'Zisk [€]': f"{profit:,.0f}",
             'Využití KGJ [%]': f"{smooth['utilization_pct']:.1f}",
@@ -141,7 +142,10 @@ def create_scenario_comparison_df(scenarios):
             'Avg Runtime [h]': f"{smooth['avg_run_hours']:.1f}",
             'Total Hours ON': smooth['total_on_hours'],
             'Shortfall [MWh]': f"{shortfall:.1f}",
-        })
+        }
+        if co2_total is not None:
+            row['CO₂ [tCO₂]'] = f"{co2_total:,.1f}"
+        data.append(row)
     
     return pd.DataFrame(data)
 
@@ -226,14 +230,18 @@ def to_excel_monthly(monthly_pr, month_names):
             if not m_data:
                 continue
             best_pr = max(m_data, key=lambda pr: m_data[pr]['profit'])
-            best_rows.append({
+            br = {
                 'Měsíc':           month_names.get(month, month),
                 'Nejlepší profil': best_pr.upper(),
                 'Zisk [€]':        round(m_data[best_pr]['profit'], 0),
                 'Zisk/hod [€]':    round(m_data[best_pr]['profit_per_h'], 2),
                 'Využití KGJ [%]': round(m_data[best_pr]['smoothness']['utilization_pct'], 1),
                 'Stabilita [%]':   round(m_data[best_pr]['smoothness']['stability_score'], 1),
-            })
+            }
+            co2_val = m_data[best_pr].get('total_co2')
+            if co2_val is not None:
+                br['CO₂ [tCO₂]'] = round(co2_val, 1)
+            best_rows.append(br)
         if best_rows:
             _write_sheet(writer, pd.DataFrame(best_rows), 'Nejlepší profil / měsíc', hdr_fmt, num_fmt, txt_fmt)
 
@@ -461,7 +469,7 @@ if st.session_state.fwd_data is not None:
 # PARAMETRY
 # ────────────────────────────────────────────────
 p = {}
-t_gen, t_tech = st.tabs(["Obecné", "Technika"])
+t_gen, t_tech, t_co2 = st.tabs(["Obecné", "Technika", "Emise CO₂"])
 
 with t_gen:
     col1, col2 = st.columns(2)
@@ -581,6 +589,26 @@ with t_tech:
         p['imp_hour_limit_on'] = st.checkbox("Omezit max. počet hodin importu tepla / rok", value=False)
         if p['imp_hour_limit_on']:
             p['imp_hour_limit'] = st.number_input("Max. hodin importu tepla / rok", value=2000, min_value=1)
+
+with t_co2:
+    st.markdown("#### Emisní faktory a CO₂ cena")
+    co2_col1, co2_col2 = st.columns(2)
+    with co2_col1:
+        p['co2_gas_factor']  = st.number_input(
+            "Emisní faktor plynu [tCO₂/MWh]", value=0.202, step=0.001, format="%.3f",
+            help="Typická hodnota zemní plyn: 0.202 tCO₂/MWh")
+        p['co2_grid_factor'] = st.number_input(
+            "Emisní faktor sítě [tCO₂/MWh]", value=0.250, step=0.001, format="%.3f",
+            help="CZ grid mix 2023 cca 0.25 tCO₂/MWh (EEA)")
+    with co2_col2:
+        p['co2_price'] = st.number_input(
+            "Cena CO₂ [€/tCO₂]", value=0.0, min_value=0.0, step=1.0,
+            help="EU ETS cena. 0 = CO₂ jen jako KPI (bez vlivu na optimalizaci). "
+                 "Kladná hodnota → CO₂ náklad vstupuje do objective funkce.")
+    st.caption(
+        "CO₂ bilance = emise z plynu (KGJ + kotel) + emise z nákupu EE − úspora za export EE. "
+        "Zobrazuje se ve výsledcích jako informativní KPI."
+    )
 
 # ────────────────────────────────────────────────
 # POMOCNÉ FUNKCE PRO SOLVER
@@ -785,6 +813,18 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
 
         revenue = (h_price * heat_delivered
                    + (p_ee_m - dist_sell_net - fve_dist_sell_cost) * ee_export[t])
+        co2_price = p.get('co2_price', 0.0)
+        co2_cost = 0
+        if co2_price > 0:
+            co2_gas_factor  = p.get('co2_gas_factor',  0.202)
+            co2_grid_factor = p.get('co2_grid_factor', 0.250)
+            gas_kgj_mwh  = (c0_th * on[t] + c1_th * q_kgj[t]) if u['kgj']  else 0
+            gas_boil_mwh = (q_boil[t] / boil_eff)               if u['boil'] else 0
+            co2_cost = co2_price * (
+                co2_gas_factor  * (gas_kgj_mwh + gas_boil_mwh) +
+                co2_grid_factor * ee_import[t] -
+                co2_grid_factor * ee_export[t]
+            )
         costs = (
             ((p_gas_kgj  + p['gas_dist']) * (c0_th * on[t] + c1_th * q_kgj[t]) if u['kgj'] else 0) +
             ((p_gas_boil + p['gas_dist']) * (q_boil[t] / boil_eff)       if u['boil']     else 0) +
@@ -794,7 +834,8 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
             (p['k_start_cost'] * start[t]                                 if u['kgj']      else 0) +
             (p['bess_cycle_cost'] * (bess_cha[t] + bess_dis[t])           if u['bess']     else 0) +
             bess_dist_buy_cost + bess_dist_sell_cost +
-            p['shortfall_penalty'] * heat_shortfall[t]
+            p['shortfall_penalty'] * heat_shortfall[t] +
+            co2_cost
         )
         obj.append(revenue - costs)
 
@@ -845,6 +886,9 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
     c_gas_kgj_h, c_gas_boil_h = [], []
     c_ee_imp_h, c_ee_ek_h, c_imp_heat_h = [], [], []
     c_start_h, c_bess_h, c_penalty_h = [], [], []
+    co2_kgj_h, co2_kotel_h, co2_grid_h = [], [], []
+    co2_gas_f   = p.get('co2_gas_factor',  0.202)
+    co2_grid_f  = p.get('co2_grid_factor', 0.250)
 
     for t in range(T):
         p_ee_m   = df['ee_price'].iloc[t]  + ee_delta
@@ -868,6 +912,12 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
         cb  = (p['bess_cycle_cost'] * (res['BESS nabíjení [MW]'].iloc[t] + res['BESS vybíjení [MW]'].iloc[t])
                if u['bess'] else 0)
         cp  = p['shortfall_penalty'] * res['Shortfall [MW]'].iloc[t]
+
+        gas_kgj_mwh  = (c0_th * res['KGJ on'].iloc[t] + c1_th * res['KGJ [MW_th]'].iloc[t]) if u['kgj'] else 0
+        gas_boil_mwh = (res['Kotel [MW_th]'].iloc[t] / boil_eff) if u['boil'] else 0
+        co2_kgj_h.append(co2_gas_f  * gas_kgj_mwh)
+        co2_kotel_h.append(co2_gas_f * gas_boil_mwh)
+        co2_grid_h.append(co2_grid_f * (res['EE import [MW]'].iloc[t] - res['EE export [MW]'].iloc[t]))
 
         rev_teplo_h.append(rt);  rev_ee_h.append(re)
         c_gas_kgj_h.append(cg1); c_gas_boil_h.append(cg2)
@@ -895,8 +945,17 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
     ]
     res['Kumulativní zisk [€]'] = res['Hodinový zisk [€]'].cumsum()
 
+    # ── CO₂ emise ─────────────────────────────────
+    res['CO₂ KGJ [tCO₂]']   = co2_kgj_h
+    res['CO₂ Kotel [tCO₂]'] = co2_kotel_h
+    res['CO₂ Síť [tCO₂]']   = co2_grid_h
+    res['CO₂ Celkem [tCO₂]']= [co2_kgj_h[t] + co2_kotel_h[t] + co2_grid_h[t] for t in range(T)]
+
+    total_co2 = sum(co2_kgj_h[t] + co2_kotel_h[t] + co2_grid_h[t] for t in range(T))
+
     return {'res': res, 'start': start, 'on': on, 'on_boil': on_boil, 'on_imp': on_imp,
-            'status': status, 'total_profit': res['Hodinový zisk [€]'].sum()}
+            'status': status, 'total_profit': res['Hodinový zisk [€]'].sum(),
+            'total_co2': total_co2}
 
 
 def run_scenario_analysis(df, params, uses, profiles_to_run, custom_hours=None, 
@@ -981,6 +1040,7 @@ def run_monthly_profile_analysis(df, params, uses, profiles_to_run,
                     'profit':       r['total_profit'],
                     'profit_per_h': r['total_profit'] / n_hours if n_hours > 0 else 0,
                     'smoothness':   calculate_smoothness_metrics(r['res']),
+                    'total_co2':    r.get('total_co2', 0.0),
                 }
             run_idx += 1
             progress.progress(run_idx / total_runs)
@@ -1171,13 +1231,17 @@ if st.session_state.monthly_profile_results is not None:
         if not m_data:
             continue
         best_pr = max(m_data, key=lambda pr: m_data[pr]['profit'])
-        best_rows.append({
+        row_best = {
             'Měsíc':           MONTH_NAMES.get(month, month),
             'Nejlepší profil': best_pr.upper(),
             'Zisk/hod [€]':    f"{m_data[best_pr]['profit_per_h']:,.1f}",
             'Zisk celkem [€]': f"{m_data[best_pr]['profit']:,.0f}",
             'Stabilita [%]':   f"{m_data[best_pr]['smoothness']['stability_score']:.1f}",
-        })
+        }
+        co2_m = m_data[best_pr].get('total_co2')
+        if co2_m is not None:
+            row_best['CO₂ [tCO₂]'] = f"{co2_m:,.1f}"
+        best_rows.append(row_best)
 
     if best_rows:
         df_best = pd.DataFrame(best_rows)
@@ -1518,7 +1582,20 @@ if st.session_state.scenario_results is not None:
         r4.metric("🔴 Nákl EE", f"{c_ee_total:,.0f} €")
         r5.metric("🔴 Nákl import", f"{c_imp_total:,.0f} €")
         r6.metric("🔴 Ostatní", f"{c_other_total:,.0f} €")
-        
+
+        # ── CO₂ emise ──
+        if 'CO₂ Celkem [tCO₂]' in res.columns:
+            st.markdown("#### 🌿 Emise CO₂")
+            co_1, co_2, co_3, co_4 = st.columns(4)
+            co_1.metric("CO₂ celkem", f"{res['CO₂ Celkem [tCO₂]'].sum():,.1f} t",
+                        help="Celkové emise za sledované období")
+            co_2.metric("CO₂ KGJ", f"{res['CO₂ KGJ [tCO₂]'].sum():,.1f} t",
+                        help="Emise ze spalování plynu v KGJ")
+            co_3.metric("CO₂ Kotel", f"{res['CO₂ Kotel [tCO₂]'].sum():,.1f} t",
+                        help="Emise ze spalování plynu v kotli")
+            co_4.metric("CO₂ Síť (netto)", f"{res['CO₂ Síť [tCO₂]'].sum():,.1f} t",
+                        help="Emise z nákupu EE minus úspora za export EE do sítě")
+
         # ── Grafy pro vybraný profil ──
         st.markdown("#### 🔥 Pokrytí Tepelné Poptávky")
         fig = go.Figure()
@@ -1638,6 +1715,19 @@ if st.session_state.results is not None and st.session_state.scenario_results is
 
     if total_shortfall > 0.5:
         st.warning(f"⚠️ Celkový shortfall {total_shortfall:.1f} MWh – zvyš penalizaci nebo kapacity zdrojů.")
+
+    # ── CO₂ emise ──
+    if 'CO₂ Celkem [tCO₂]' in res.columns:
+        st.markdown("**🌿 Emise CO₂**")
+        co_1, co_2, co_3, co_4 = st.columns(4)
+        co_1.metric("CO₂ celkem", f"{res['CO₂ Celkem [tCO₂]'].sum():,.1f} t",
+                    help="Celkové emise za sledované období")
+        co_2.metric("CO₂ KGJ", f"{res['CO₂ KGJ [tCO₂]'].sum():,.1f} t",
+                    help="Emise ze spalování plynu v KGJ")
+        co_3.metric("CO₂ Kotel", f"{res['CO₂ Kotel [tCO₂]'].sum():,.1f} t",
+                    help="Emise ze spalování plynu v kotli")
+        co_4.metric("CO₂ Síť (netto)", f"{res['CO₂ Síť [tCO₂]'].sum():,.1f} t",
+                    help="Emise z nákupu EE minus úspora za export EE do sítě")
 
     # ────────────────────────────────────────────
     # VŠECHNY OSTATNÍ GRAFY (původní obsah)

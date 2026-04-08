@@ -402,6 +402,7 @@ with st.sidebar:
         default=['free', 'base', 'peak', 'extpeak', 'offpeak'],
         help="Spusť optimalizaci pro vybrané profily a porovnej je"
     )
+    st.caption("💡 BASE = KGJ vždy zapnuto 24/7 (ignoruje limit hodin provozu)")
 
     profile_definitions = {
         'free':    {'name': 'Volná Opt.',          'hours': None,                          'desc': 'Bez omezení'},
@@ -438,8 +439,12 @@ with st.sidebar:
     st.subheader("4️⃣ Režim Porovnání")
     scenario_mode = st.radio(
         "Spusť optimalizaci:",
-        ["Pouze aktuální nastavení", "Všechny vybrané profily", "Měsíční analýza profilů"],
-        help="'Všechny profily' = porovnání scénářů | 'Měsíční analýza' = nejlepší profil per měsíc"
+        ["Jednorázová optimalizace (FREE profil)", "Porovnání profilů – celé období", "Měsíční analýza + Roční plán"],
+        help=(
+            "Jednorázová: jedna optimalizace bez časových omezení KGJ, plný detail výsledků.\n"
+            "Porovnání: všechny vybrané profily přes celé období, side-by-side tabulka.\n"
+            "Měsíční analýza: profil × měsíc matrix + sestavení ročního plánu s kvartálním override."
+        )
     )
 
 # ────────────────────────────────────────────────
@@ -779,8 +784,9 @@ def run_optimization_with_profile(df, params, uses, profile_type='free', custom_
                 if t + dt < T:
                     model += on[t+dt] >= start[t]
         
-        # Roční limit hodin
-        if p.get('kgj_hour_limit_on') and p.get('kgj_hour_limit'):
+        # Roční limit hodin — pro BASE profil se ignoruje (KGJ jede vždy)
+        if (p.get('kgj_hour_limit_on') and p.get('kgj_hour_limit')
+                and profile_type != 'base'):
             model += pulp.lpSum(on[t] for t in range(T)) <= p['kgj_hour_limit']
         
         # NOVÉ: Limit startů za měsíc
@@ -1025,7 +1031,9 @@ def run_scenario_analysis(df, params, uses, profiles_to_run, custom_hours=None,
                 'smoothness': smoothness,
                 'profile_name': profile.upper(),
             }
-        
+        else:
+            st.warning(f"⚠️ Profil {profile.upper()} nenašel řešení – zkontroluj parametry nebo omezení hodin.")
+
         progress_bar.progress((idx + 1) / len(profiles_to_run))
     
     status_text.write("✅ Scenáře spočítány!")
@@ -1178,7 +1186,7 @@ if st.session_state.fwd_data is not None and loc_file is not None:
     col_mode_1, col_mode_2 = st.columns([2, 1])
     
     with col_mode_1:
-        if scenario_mode == "Pouze aktuální nastavení":
+        if scenario_mode == "Jednorázová optimalizace (FREE profil)":
             st.markdown("### 🎯 Režim: Jednoduché Spuštění")
             st.markdown(
                 f"Optimalizace se spustí s **aktuálním profilem KGJ** a všemi zadanými parametry. "
@@ -1206,7 +1214,7 @@ if st.session_state.fwd_data is not None and loc_file is not None:
                 st.session_state.scenario_results = None  # Vymaž scenario results
                 st.success("✅ Optimalizace dokončena!")
         
-        elif scenario_mode == "Všechny vybrané profily":
+        elif scenario_mode == "Porovnání profilů – celé období":
             st.markdown("### 📊 Režim: Porovnání Profilů")
             st.markdown(
                 f"Spustit se budou profily: **{', '.join([pr.upper() for pr in profiles_to_run])}**. "
@@ -1235,7 +1243,7 @@ if st.session_state.fwd_data is not None and loc_file is not None:
                 st.session_state.monthly_profile_results = None
                 st.success("✅ Scenáristická analýza dokončena!")
 
-        else:  # Měsíční analýza profilů
+        else:  # Měsíční analýza + Roční plán
             st.markdown("### 🗓️ Režim: Měsíční Analýza Profilů")
             n_runs = len(profiles_to_run) * pd.to_datetime(df['datetime']).dt.month.nunique()
             st.markdown(
@@ -1261,7 +1269,7 @@ if st.session_state.fwd_data is not None and loc_file is not None:
     with col_mode_2:
         st.markdown("")
         st.markdown("")
-        if scenario_mode == "Všechny vybrané profily":
+        if scenario_mode == "Porovnání profilů – celé období":
             selected_profile = st.radio(
                 "Profil k detailu:",
                 options=profiles_to_run,
@@ -1356,6 +1364,27 @@ if st.session_state.monthly_profile_results is not None:
     # ── R2: Kombinovaný roční plán ──
     st.divider()
     st.subheader("📋 Kombinovaný roční plán (nejlepší profil / měsíc)")
+
+    st.markdown("**Kvartální override profilu** (volitelné – ponech 'Auto' pro max zisk per měsíc):")
+    _qcols = st.columns(4)
+    _q_override = {}
+    _quarter_months = {
+        'Q1 (Led–Bře)': [1, 2, 3],
+        'Q2 (Dub–Čvn)': [4, 5, 6],
+        'Q3 (Čvc–Zář)': [7, 8, 9],
+        'Q4 (Říj–Pro)': [10, 11, 12],
+    }
+    for _qi, (_qlabel, _qmonths) in enumerate(_quarter_months.items()):
+        with _qcols[_qi]:
+            _choice = st.selectbox(
+                _qlabel,
+                ['Auto (max zisk)'] + [_pr.upper() for _pr in profiles_to_run],
+                key=f"q_override_{_qi}"
+            )
+            if _choice != 'Auto (max zisk)':
+                for _m in _qmonths:
+                    _q_override[_m] = _choice.lower()
+
     if st.button("📋 Sestavit roční plán", key="btn_annual_plan"):
         with st.spinner("⏳ Sestavuji roční plán …"):
             df_annual_src = st.session_state.df_main
@@ -1366,7 +1395,11 @@ if st.session_state.monthly_profile_results is not None:
                 m_data = monthly_pr[month]
                 if not m_data:
                     continue
-                best_pr = max(m_data, key=lambda pr: m_data[pr]['profit'])
+                _override = _q_override.get(month)
+                if _override and _override in m_data:
+                    best_pr = _override
+                else:
+                    best_pr = max(m_data, key=lambda pr: m_data[pr]['profit'])
                 mask = pd.to_datetime(df_annual_src['datetime']).dt.month == month
                 r = run_optimization_with_profile(
                     df=df_annual_src, params=p, uses=uses,

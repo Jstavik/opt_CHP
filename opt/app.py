@@ -1,4 +1,5 @@
 import io
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -232,8 +233,12 @@ def _wb_formats(workbook):
     grn = workbook.add_format({'bold': True, 'bg_color': '#C6EFCE', 'border': 1})
     return hdr, num, txt, grn
 
+def _safe_sheet(name: str) -> str:
+    """Odstraní znaky neplatné v Excel názvech listů, zkrátí na 31 znaků."""
+    return re.sub(r'[/\\*?:\[\]]', '-', name)[:31]
+
 def _write_sheet(writer, df, sheet_name, hdr_fmt, num_fmt, txt_fmt):
-    df.to_excel(writer, index=False, sheet_name=sheet_name)
+    df.to_excel(writer, index=False, sheet_name=_safe_sheet(sheet_name))
     ws = writer.sheets[sheet_name]
     for col_idx, col_name in enumerate(df.columns):
         is_num = pd.api.types.is_numeric_dtype(df.iloc[:, col_idx])
@@ -327,7 +332,7 @@ def to_excel_monthly(monthly_pr, month_names):
         _write_sheet(writer, df_matrix, 'Matice zisk [€]', hdr_fmt, num_fmt, txt_fmt)
 
         # Podmíněné formátování – zelená = max v řádku
-        ws = writer.sheets['Matice zisk [€]']
+        ws = writer.sheets[_safe_sheet('Matice zisk [€]')]
         n_prof = len(all_profiles)
         if n_prof > 0:
             ws.conditional_format(1, 1, len(months_sorted), n_prof, {
@@ -481,17 +486,6 @@ with st.sidebar:
     if use_month_start_limit:
         max_starts_per_month = st.number_input("Max. startů/měsíc", value=5, min_value=1, max_value=30)
     
-    # Scenario Mode
-    st.subheader("4️⃣ Režim Porovnání")
-    scenario_mode = st.radio(
-        "Spusť optimalizaci:",
-        ["Jednorázová optimalizace (FREE profil)", "Porovnání profilů – celé období", "Měsíční analýza + Roční plán"],
-        help=(
-            "Jednorázová: jedna optimalizace bez časových omezení KGJ, plný detail výsledků.\n"
-            "Porovnání: všechny vybrané profily přes celé období, side-by-side tabulka.\n"
-            "Měsíční analýza: profil × měsíc matrix + sestavení ročního plánu s kvartálním override."
-        )
-    )
 
 # ────────────────────────────────────────────────
 # FWD GRAFY
@@ -1227,103 +1221,45 @@ if st.session_state.fwd_data is not None and loc_file is not None:
                 bess=use_bess, fve=use_fve, ext_heat=use_ext_heat)
 
     # ════════════════════════════════════════════════
-    # SCENARIO MODE SELECTION & EXECUTION
+    # SPUŠTĚNÍ ANALÝZY – jedno tlačítko, vše najednou
     # ════════════════════════════════════════════════
-    
-    col_mode_1, col_mode_2 = st.columns([2, 1])
-    
-    with col_mode_1:
-        if scenario_mode == "Jednorázová optimalizace (FREE profil)":
-            st.markdown("### 🎯 Režim: Jednoduché Spuštění")
-            st.markdown(
-                f"Optimalizace se spustí s **aktuálním profilem KGJ** a všemi zadanými parametry. "
-                f"Vhodné pro detailní analýzu jednoho scénáře."
+    n_runs = len(profiles_to_run) * pd.to_datetime(df['datetime']).dt.month.nunique()
+    st.markdown(
+        f"Profily: **{', '.join(pr.upper() for pr in profiles_to_run)}** · "
+        f"Celé období + měsíční analýza ({n_runs} kombinací)"
+    )
+
+    if st.button("🚀 Spustit analýzu všech profilů", type="primary", key="btn_run_all"):
+        with st.spinner("⏳ Spouštím optimalizaci pro všechny profily …"):
+            _ch = custom_hours if 'custom' in profiles_to_run else None
+            _ms = max_starts_per_month if use_month_start_limit else None
+
+            # 1) Porovnání profilů přes celé období
+            scenarios = run_scenario_analysis(
+                df=df, params=p, uses=uses,
+                profiles_to_run=profiles_to_run,
+                custom_hours=_ch,
+                period_start=period_start, period_end=period_end,
+                max_starts_per_month=_ms
             )
-            
-            if st.button("🚀 Spustit optimalizaci", type="primary", key="btn_single"):
-                with st.spinner("⏳ Probíhá optimalizace …"):
-                    result = run_optimization_with_profile(
-                        df=df,
-                        params=p,
-                        uses=uses,
-                        profile_type='free',  # Volná optimalizace
-                        max_starts_per_month=max_starts_per_month if use_month_start_limit else None,
-                        period_mask=None
-                    )
-                
-                if result is None:
-                    st.error("❌ Optimalizace nenašla přijatelné řešení. Zkontroluj parametry.")
-                    st.stop()
-                
-                st.session_state.results = result
-                st.session_state.df_main = df.copy()
-                st.session_state.uses = uses
-                st.session_state.scenario_results = None  # Vymaž scenario results
-                st.success("✅ Optimalizace dokončena!")
-        
-        elif scenario_mode == "Porovnání profilů – celé období":
-            st.markdown("### 📊 Režim: Porovnání Profilů")
-            st.markdown(
-                f"Spustit se budou profily: **{', '.join([pr.upper() for pr in profiles_to_run])}**. "
-                f"Poté se zobrazí přehledné porovnání jejich ekonomiky a kvality provozu."
+            if not scenarios:
+                st.error("❌ Žádný profil nebyl úspěšně vypočten. Zkontroluj parametry.")
+                st.stop()
+
+            # 2) Měsíční analýza
+            monthly_res = run_monthly_profile_analysis(
+                df=df, params=p, uses=uses,
+                profiles_to_run=profiles_to_run,
+                custom_hours=_ch, max_starts_per_month=_ms
             )
 
-            if st.button("🔬 Spustit analýzu scénářů", type="primary", key="btn_scenarios"):
-                with st.spinner("⏳ Probíhá scenáristická analýza …"):
-                    scenarios = run_scenario_analysis(
-                        df=df,
-                        params=p,
-                        uses=uses,
-                        profiles_to_run=profiles_to_run,
-                        custom_hours=custom_hours if 'custom' in profiles_to_run else None,
-                        period_start=period_start,
-                        period_end=period_end,
-                        max_starts_per_month=max_starts_per_month if use_month_start_limit else None
-                    )
-
-                if not scenarios:
-                    st.error("❌ Žádný scenář nebyl úspěšně vypočten!")
-                    st.stop()
-
-                st.session_state.scenario_results = scenarios
-                st.session_state.results = None
-                st.session_state.monthly_profile_results = None
-                st.success("✅ Scenáristická analýza dokončena!")
-
-        else:  # Měsíční analýza + Roční plán
-            st.markdown("### 🗓️ Režim: Měsíční Analýza Profilů")
-            n_runs = len(profiles_to_run) * pd.to_datetime(df['datetime']).dt.month.nunique()
-            st.markdown(
-                f"Systém spustí optimalizaci pro každý **měsíc × profil** "
-                f"({n_runs} kombinací) a ukáže, který profil je optimální pro který měsíc."
-            )
-
-            if st.button("🗓️ Spustit měsíční analýzu", type="primary", key="btn_monthly"):
-                with st.spinner("⏳ Probíhá měsíční analýza …"):
-                    monthly_res = run_monthly_profile_analysis(
-                        df=df, params=p, uses=uses,
-                        profiles_to_run=profiles_to_run,
-                        custom_hours=custom_hours if 'custom' in profiles_to_run else None,
-                        max_starts_per_month=max_starts_per_month if use_month_start_limit else None
-                    )
-
-                st.session_state.monthly_profile_results = monthly_res
-                st.session_state.results = None
-                st.session_state.scenario_results = None
-                st.session_state.annual_plan_result = None
-                st.success("✅ Měsíční analýza dokončena!")
-
-    with col_mode_2:
-        st.markdown("")
-        st.markdown("")
-        if scenario_mode == "Porovnání profilů – celé období":
-            selected_profile = st.radio(
-                "Profil k detailu:",
-                options=profiles_to_run,
-                format_func=lambda x: x.upper(),
-                key="profile_selector"
-            )
-            st.session_state.selected_profile = selected_profile
+        st.session_state.scenario_results = scenarios
+        st.session_state.monthly_profile_results = monthly_res
+        st.session_state.results = None
+        st.session_state.annual_plan_result = None
+        st.session_state.df_main = df.copy()
+        st.session_state.uses = uses
+        st.success("✅ Analýza dokončena!")
 
 # ────────────────────────────────────────────────
 # MONTHLY PROFILE ANALYSIS VIEW
@@ -1749,179 +1685,128 @@ if st.session_state.scenario_results is not None:
             with wf_cols[col_idx]:
                 st.plotly_chart(fig_wf, use_container_width=True)
 
-    # ── Detailní view vybraného profilu ──
+    # ── Detailní view – záložka per profil ──────────────────────────
     st.divider()
-    st.subheader(f"🔍 Detailní Analýza: {st.session_state.selected_profile.upper()}")
-    
-    selected_scenario = scenarios.get(st.session_state.selected_profile)
-    if selected_scenario and selected_scenario['result'] is not None:
-        result = selected_scenario['result']
-        res = result['res']
-        smoothness = selected_scenario['smoothness']
-        
-        # Smoothness Metrics Box
-        col_sm_1, col_sm_2, col_sm_3, col_sm_4, col_sm_5, col_sm_6 = st.columns(6)
+    st.subheader("🔍 Detailní analýza per profil")
 
-        with col_sm_1:
-            st.metric(
-                "Využití KGJ",
-                f"{smoothness['utilization_pct']:.1f}%",
-                help="Podíl hodin, kdy KGJ skutečně běželo (z celkového období)"
-            )
+    _tab_prs = [pr for pr in profiles_to_run if pr in scenarios and scenarios[pr]['result'] is not None]
+    if _tab_prs:
+        _dtabs = st.tabs([pr.upper() for pr in _tab_prs])
+        for _dtab, pr in zip(_dtabs, _tab_prs):
+            with _dtab:
+                _sc     = scenarios[pr]
+                result  = _sc['result']
+                res     = result['res']
+                smoothness = _sc['smoothness']
 
-        with col_sm_2:
-            st.metric(
-                "Stabilita Skóre",
-                f"{smoothness['stability_score']:.1f}%",
-                help="0-100% (100% = velmi hladký provoz)"
-            )
+                col_sm_1, col_sm_2, col_sm_3, col_sm_4, col_sm_5, col_sm_6 = st.columns(6)
+                with col_sm_1:
+                    st.metric("Využití KGJ", f"{smoothness['utilization_pct']:.1f}%",
+                              help="Podíl hodin, kdy KGJ běželo")
+                with col_sm_2:
+                    st.metric("Stabilita", f"{smoothness['stability_score']:.1f}%",
+                              help="100% = velmi hladký provoz")
+                with col_sm_3:
+                    st.metric("Přechodů", f"{smoothness['transitions']}",
+                              help="Počet start-stop cyklů")
+                with col_sm_4:
+                    st.metric("Avg Runtime", f"{smoothness['avg_run_hours']:.1f} h")
+                with col_sm_5:
+                    st.metric("Min Runtime", f"{smoothness['min_run_hours']:.0f} h")
+                with col_sm_6:
+                    st.metric("Max Runtime", f"{smoothness['max_run_hours']:.0f} h")
 
-        with col_sm_3:
-            st.metric(
-                "Přechodů ON↔OFF",
-                f"{smoothness['transitions']}",
-                help="Počet start-stop cyklů (méně = lépe)"
-            )
+                total_profit    = result['total_profit']
+                total_shortfall = res['Shortfall [MW]'].sum()
+                target_heat     = (res['Poptávka tepla [MW]'] * p['h_cover']).sum()
+                coverage        = 100*(1 - total_shortfall/target_heat) if target_heat > 0 else 100.0
+                total_ee_gen    = res['EE z KGJ [MW]'].sum() + res['EE z FVE [MW]'].sum()
+                kgj_hours       = int(res['KGJ on'].sum())
+                rev_teplo_total = res['Rev teplo [€]'].sum()
+                rev_ee_total    = res['Rev EE [€]'].sum()
+                c_gas_total     = res['Nákl plyn KGJ [€]'].sum() + res['Nákl plyn kotel [€]'].sum()
+                c_ee_total      = res['Nákl EE import [€]'].sum() + res['Nákl EE EK [€]'].sum()
+                c_imp_total     = res['Nákl imp tepla [€]'].sum()
+                c_other_total   = res['Nákl starty [€]'].sum() + res['Nákl BESS [€]'].sum()
 
-        with col_sm_4:
-            st.metric(
-                "Avg Runtime",
-                f"{smoothness['avg_run_hours']:.1f} h",
-                help="Průměrná délka provozu"
-            )
+                st.markdown("#### 📊 Klíčové Metriky")
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                m1.metric("Celkový zisk", f"{total_profit:,.0f} €")
+                m2.metric("Shortfall", f"{total_shortfall:,.1f} MWh")
+                m3.metric("Pokrytí poptávky", f"{coverage:.1f} %")
+                m4.metric("Export EE", f"{res['EE export [MW]'].sum():,.1f} MWh")
+                m5.metric("Výroba EE", f"{total_ee_gen:,.1f} MWh")
+                m6.metric("Provozní hodiny KGJ", f"{kgj_hours:,} h")
 
-        with col_sm_5:
-            st.metric(
-                "Min Runtime",
-                f"{smoothness['min_run_hours']:.0f} h",
-                help="Nejkratší běh"
-            )
+                st.markdown("#### 💰 Rozpad Zisku")
+                r1, r2, r3, r4, r5, r6 = st.columns(6)
+                r1.metric("🔥 Příjmy teplo", f"{rev_teplo_total:,.0f} €")
+                r2.metric("⚡ Příjmy EE", f"{rev_ee_total:,.0f} €")
+                r3.metric("🔴 Nákl plyn", f"{c_gas_total:,.0f} €")
+                r4.metric("🔴 Nákl EE", f"{c_ee_total:,.0f} €")
+                r5.metric("🔴 Nákl import", f"{c_imp_total:,.0f} €")
+                r6.metric("🔴 Ostatní", f"{c_other_total:,.0f} €")
 
-        with col_sm_6:
-            st.metric(
-                "Max Runtime",
-                f"{smoothness['max_run_hours']:.0f} h",
-                help="Nejdelší běh"
-            )
-        
-        # Pokud máme scenario results, zobraz ALL metriky normálně
-        total_profit     = result['total_profit']
-        total_shortfall  = res['Shortfall [MW]'].sum()
-        target_heat      = (res['Poptávka tepla [MW]'] * p['h_cover']).sum()
-        coverage         = 100*(1 - total_shortfall/target_heat) if target_heat > 0 else 100.0
-        total_ee_gen     = res['EE z KGJ [MW]'].sum() + res['EE z FVE [MW]'].sum()
-        kgj_hours        = int(res['KGJ on'].sum())
-        
-        rev_teplo_total  = res['Rev teplo [€]'].sum()
-        rev_ee_total     = res['Rev EE [€]'].sum()
-        c_gas_total      = res['Nákl plyn KGJ [€]'].sum() + res['Nákl plyn kotel [€]'].sum()
-        c_ee_total       = res['Nákl EE import [€]'].sum() + res['Nákl EE EK [€]'].sum()
-        c_imp_total      = res['Nákl imp tepla [€]'].sum()
-        c_other_total    = res['Nákl starty [€]'].sum() + res['Nákl BESS [€]'].sum()
-        
-        st.markdown("#### 📊 Klíčové Metriky")
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Celkový zisk", f"{total_profit:,.0f} €")
-        m2.metric("Shortfall", f"{total_shortfall:,.1f} MWh")
-        m3.metric("Pokrytí poptávky", f"{coverage:.1f} %")
-        m4.metric("Export EE", f"{res['EE export [MW]'].sum():,.1f} MWh")
-        m5.metric("Výroba EE", f"{total_ee_gen:,.1f} MWh")
-        m6.metric("Provozní hodiny KGJ", f"{kgj_hours:,} h")
-        
-        st.markdown("#### 💰 Rozpad Zisku")
-        r1, r2, r3, r4, r5, r6 = st.columns(6)
-        r1.metric("🔥 Příjmy teplo", f"{rev_teplo_total:,.0f} €")
-        r2.metric("⚡ Příjmy EE", f"{rev_ee_total:,.0f} €")
-        r3.metric("🔴 Nákl plyn", f"{c_gas_total:,.0f} €")
-        r4.metric("🔴 Nákl EE", f"{c_ee_total:,.0f} €")
-        r5.metric("🔴 Nákl import", f"{c_imp_total:,.0f} €")
-        r6.metric("🔴 Ostatní", f"{c_other_total:,.0f} €")
+                if 'CO₂ Celkem [tCO₂]' in res.columns:
+                    st.markdown("#### 🌿 Emise CO₂")
+                    co_1, co_2, co_3, co_4 = st.columns(4)
+                    co_1.metric("CO₂ celkem", f"{res['CO₂ Celkem [tCO₂]'].sum():,.1f} t")
+                    co_2.metric("CO₂ KGJ", f"{res['CO₂ KGJ [tCO₂]'].sum():,.1f} t")
+                    co_3.metric("CO₂ Kotel", f"{res['CO₂ Kotel [tCO₂]'].sum():,.1f} t")
+                    co_4.metric("CO₂ Síť (netto)", f"{res['CO₂ Síť [tCO₂]'].sum():,.1f} t")
 
-        # ── CO₂ emise ──
-        if 'CO₂ Celkem [tCO₂]' in res.columns:
-            st.markdown("#### 🌿 Emise CO₂")
-            co_1, co_2, co_3, co_4 = st.columns(4)
-            co_1.metric("CO₂ celkem", f"{res['CO₂ Celkem [tCO₂]'].sum():,.1f} t",
-                        help="Celkové emise za sledované období")
-            co_2.metric("CO₂ KGJ", f"{res['CO₂ KGJ [tCO₂]'].sum():,.1f} t",
-                        help="Emise ze spalování plynu v KGJ")
-            co_3.metric("CO₂ Kotel", f"{res['CO₂ Kotel [tCO₂]'].sum():,.1f} t",
-                        help="Emise ze spalování plynu v kotli")
-            co_4.metric("CO₂ Síť (netto)", f"{res['CO₂ Síť [tCO₂]'].sum():,.1f} t",
-                        help="Emise z nákupu EE minus úspora za export EE do sítě")
+                st.markdown("#### 🔥 Pokrytí Tepelné Poptávky")
+                fig = go.Figure()
+                for col, name, color in [
+                    ('KGJ [MW_th]',          'KGJ',         '#27ae60'),
+                    ('Kotel [MW_th]',        'Kotel',        '#3498db'),
+                    ('Elektrokotel [MW_th]', 'Elektrokotel', '#9b59b6'),
+                    ('Import tepla [MW_th]', 'Import tepla', '#e74c3c'),
+                    ('TES netto [MW_th]',    'TES netto',    '#f39c12'),
+                ]:
+                    if col in res.columns:
+                        fig.add_trace(go.Scatter(x=res['Čas'], y=res[col].clip(lower=0),
+                            name=name, stackgroup='teplo', fillcolor=color, line_width=0))
+                fig.add_trace(go.Scatter(x=res['Čas'], y=res['Shortfall [MW]'],
+                    name='Nedodáno ⚠️', stackgroup='teplo', fillcolor='rgba(200,0,0,0.45)', line_width=0))
+                fig.add_trace(go.Scatter(x=res['Čas'], y=res['Poptávka tepla [MW]']*p['h_cover'],
+                    name='Cílová poptávka', mode='lines', line=dict(color='black', width=2, dash='dot')))
+                fig.update_layout(height=450, hovermode='x unified')
+                st.plotly_chart(fig, use_container_width=True)
 
-        # ── Grafy pro vybraný profil ──
-        st.markdown("#### 🔥 Pokrytí Tepelné Poptávky")
-        fig = go.Figure()
-        for col, name, color in [
-            ('KGJ [MW_th]',          'KGJ',         '#27ae60'),
-            ('Kotel [MW_th]',        'Kotel',        '#3498db'),
-            ('Elektrokotel [MW_th]', 'Elektrokotel', '#9b59b6'),
-            ('Import tepla [MW_th]', 'Import tepla', '#e74c3c'),
-            ('TES netto [MW_th]',    'TES netto',    '#f39c12'),
-        ]:
-            if col in res.columns:
-                fig.add_trace(go.Scatter(x=res['Čas'], y=res[col].clip(lower=0),
-                    name=name, stackgroup='teplo', fillcolor=color, line_width=0))
-        fig.add_trace(go.Scatter(x=res['Čas'], y=res['Shortfall [MW]'],
-            name='Nedodáno ⚠️', stackgroup='teplo', fillcolor='rgba(200,0,0,0.45)', line_width=0))
-        fig.add_trace(go.Scatter(x=res['Čas'], y=res['Poptávka tepla [MW]']*p['h_cover'],
-            name='Cílová poptávka', mode='lines', line=dict(color='black', width=2, dash='dot')))
-        fig.update_layout(height=450, hovermode='x unified')
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown("#### ⚡ Bilance Elektřiny")
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-            row_heights=[0.5, 0.5], subplot_titles=("Zdroje EE [MW]", "Spotřeba / export EE [MW]"))
-        for col, name, color in [
-            ('EE z KGJ [MW]',      'KGJ',       '#2ecc71'),
-            ('EE z FVE [MW]',      'FVE',        '#f1c40f'),
-            ('EE import [MW]',     'Import EE',  '#2980b9'),
-            ('BESS vybíjení [MW]', 'BESS výdej', '#8e44ad'),
-        ]:
-            if col in res.columns:
-                fig.add_trace(go.Scatter(x=res['Čas'], y=res[col], name=name,
-                    stackgroup='vyroba', fillcolor=color), row=1, col=1)
-        for col, name, color in [
-            ('EE do EK [MW]',      'EK',            '#e74c3c'),
-            ('BESS nabíjení [MW]', 'BESS nabíjení', '#34495e'),
-            ('EE export [MW]',     'Export EE',     '#16a085'),
-        ]:
-            if col in res.columns:
-                fig.add_trace(go.Scatter(x=res['Čas'], y=-res[col], name=name,
-                    stackgroup='spotreba', fillcolor=color), row=2, col=1)
-        fig.update_layout(height=600, hovermode='x unified')
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown("#### 💰 Kumulativní Zisk v Čase")
-        _sel_color = PROFILE_COLORS.get(st.session_state.selected_profile, '#27ae60')
-        _fill_rgba = _sel_color.replace('#', '')
-        _r, _g, _b = int(_fill_rgba[0:2], 16), int(_fill_rgba[2:4], 16), int(_fill_rgba[4:6], 16)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=res['Čas'], y=res['Kumulativní zisk [€]'],
-            fill='tozeroy', fillcolor=f'rgba({_r},{_g},{_b},0.2)',
-            line_color=_sel_color, name='Kum. zisk'))
-        fig.update_layout(height=350, hovermode='x unified')
-        st.plotly_chart(fig, use_container_width=True)
+                st.markdown("#### ⚡ Bilance Elektřiny")
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                    row_heights=[0.5, 0.5], subplot_titles=("Zdroje EE [MW]", "Spotřeba / export EE [MW]"))
+                for col, name, color in [
+                    ('EE z KGJ [MW]',      'KGJ',       '#2ecc71'),
+                    ('EE z FVE [MW]',      'FVE',        '#f1c40f'),
+                    ('EE import [MW]',     'Import EE',  '#2980b9'),
+                    ('BESS vybíjení [MW]', 'BESS výdej', '#8e44ad'),
+                ]:
+                    if col in res.columns:
+                        fig.add_trace(go.Scatter(x=res['Čas'], y=res[col], name=name,
+                            stackgroup='vyroba', fillcolor=color), row=1, col=1)
+                for col, name, color in [
+                    ('EE do EK [MW]',      'EK',            '#e74c3c'),
+                    ('BESS nabíjení [MW]', 'BESS nabíjení', '#34495e'),
+                    ('EE export [MW]',     'Export EE',     '#16a085'),
+                ]:
+                    if col in res.columns:
+                        fig.add_trace(go.Scatter(x=res['Čas'], y=-res[col], name=name,
+                            stackgroup='spotreba', fillcolor=color), row=2, col=1)
+                fig.update_layout(height=600, hovermode='x unified')
+                st.plotly_chart(fig, use_container_width=True)
 
-        # ── Compact comparison strip ─────────────────
-        st.markdown("#### 📊 Porovnání všech profilů")
-        strip_df = create_detail_comparison_strip(scenarios, p)
-        if not strip_df.empty:
-            if strip_df['CO₂ [tCO₂]'].isna().all():
-                strip_df = strip_df.drop(columns=['CO₂ [tCO₂]'])
-            selected_upper = st.session_state.selected_profile.upper()
-
-            def _hl_selected(row):
-                color = 'background-color: #d4edda' if row['Profil'] == selected_upper else ''
-                return [color] * len(row)
-
-            fmt = {'Zisk [€]': '{:,.0f}', 'Pokrytí [%]': '{:.1f}',
-                   'Stabilita [%]': '{:.1f}', 'Avg Runtime [h]': '{:.1f}'}
-            styled = (strip_df.style.apply(_hl_selected, axis=1).format(fmt, na_rep='–')
-                      .bar(subset=['Zisk [€]'], color='#2ecc71', vmin=strip_df['Zisk [€]'].min())
-                      .bar(subset=['Stabilita [%]'], color='#3498db', vmin=0, vmax=100))
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+                st.markdown("#### 💰 Kumulativní Zisk v Čase")
+                _pr_color = PROFILE_COLORS.get(pr, '#27ae60')
+                _pr_hex   = _pr_color.replace('#', '')
+                _pr_r, _pr_g, _pr_b = int(_pr_hex[0:2],16), int(_pr_hex[2:4],16), int(_pr_hex[4:6],16)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=res['Čas'], y=res['Kumulativní zisk [€]'],
+                    fill='tozeroy', fillcolor=f'rgba({_pr_r},{_pr_g},{_pr_b},0.2)',
+                    line_color=_pr_color, name='Kum. zisk'))
+                fig.update_layout(height=350, hovermode='x unified')
+                st.plotly_chart(fig, use_container_width=True)
 
     # ── Download scénářů ──
     st.divider()
@@ -1934,248 +1819,13 @@ if st.session_state.scenario_results is not None:
         key="dl_scenarios"
     )
 
-# ────────────────────────────────────────────────
-# SINGLE RESULT VIEW (když není scenario mode)
-# ────────────────────────────────────────────────
-if st.session_state.results is not None and st.session_state.scenario_results is None:
-    result  = st.session_state.results
-    df      = st.session_state.df_main
-    res     = result['res']
-    uses    = st.session_state.get('uses', dict(kgj=use_kgj, boil=use_boil, ek=use_ek,
-                tes=use_tes, bess=use_bess, fve=use_fve, ext_heat=use_ext_heat))
-    T       = len(df)
-    boil_eff= p.get('boil_eff', 0.95)
+# ─────────────────────────────────────────────
+# CITLIVOSTNÍ ANALÝZA (standalone)
+# ─────────────────────────────────────────────
+if st.session_state.scenario_results is not None:
+    _sa_df_main = st.session_state.df_main
+    _sa_uses    = st.session_state.get('uses', uses)
 
-    st.divider()
-    st.subheader("📊 Detailní Analýza Výsledků")
-
-    # ── Agregované ekonomické hodnoty ────────────
-    total_profit     = res['Hodinový zisk [€]'].sum()
-    total_shortfall  = res['Shortfall [MW]'].sum()
-    target_heat      = (res['Poptávka tepla [MW]'] * p['h_cover']).sum()
-    coverage         = 100*(1 - total_shortfall/target_heat) if target_heat > 0 else 100.0
-    total_ee_gen     = res['EE z KGJ [MW]'].sum() + res['EE z FVE [MW]'].sum()
-    kgj_hours        = int(res['KGJ on'].sum())
-
-    rev_teplo_total  = res['Rev teplo [€]'].sum()
-    rev_ee_total     = res['Rev EE [€]'].sum()
-    c_gas_total      = res['Nákl plyn KGJ [€]'].sum() + res['Nákl plyn kotel [€]'].sum()
-    c_ee_total       = res['Nákl EE import [€]'].sum() + res['Nákl EE EK [€]'].sum()
-    c_imp_total      = res['Nákl imp tepla [€]'].sum()
-    c_other_total    = res['Nákl starty [€]'].sum() + res['Nákl BESS [€]'].sum()
-
-    # ── METRIKY – řada 1: základní ───────────────
-    st.subheader("📊 Klíčové metriky")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Celkový zisk",          f"{total_profit:,.0f} €")
-    m2.metric("Shortfall celkem",      f"{total_shortfall:,.1f} MWh")
-    m3.metric("Pokrytí poptávky",      f"{coverage:.1f} %")
-    m4.metric("Export EE",             f"{res['EE export [MW]'].sum():,.1f} MWh")
-    m5.metric("Výroba EE (KGJ+FVE)",  f"{total_ee_gen:,.1f} MWh")
-    m6.metric("Provozní hodiny KGJ",   f"{kgj_hours:,} h")
-
-    # ── METRIKY – řada 2: rozpad po komoditách ───
-    st.markdown("**Rozpad zisku po komoditách**")
-    r1, r2, r3, r4, r5, r6 = st.columns(6)
-    r1.metric("🔥 Příjmy teplo",       f"{rev_teplo_total:,.0f} €",
-              help="Prodej tepla = dodáno teplo × cena tepla")
-    r2.metric("⚡ Příjmy EE",          f"{rev_ee_total:,.0f} €",
-              help="Export EE do sítě × (cena EE − distribuce)")
-    r3.metric("🔴 Náklady plyn",       f"{c_gas_total:,.0f} €",
-              help="Spotřeba plynu KGJ + kotel × (cena plynu + distribuce)")
-    r4.metric("🔴 Náklady EE",         f"{c_ee_total:,.0f} €",
-              help="Import EE + EE do EK × (cena EE + distribuce)")
-    r5.metric("🔴 Náklady import tepla",f"{c_imp_total:,.0f} €",
-              help="Nákup tepla z externího zdroje")
-    r6.metric("🔴 Ostatní náklady",    f"{c_other_total:,.0f} €",
-              help="Náklady na starty KGJ + opotřebení BESS")
-
-    if total_shortfall > 0.5:
-        st.warning(f"⚠️ Celkový shortfall {total_shortfall:.1f} MWh – zvyš penalizaci nebo kapacity zdrojů.")
-
-    # ── CO₂ emise ──
-    if 'CO₂ Celkem [tCO₂]' in res.columns:
-        st.markdown("**🌿 Emise CO₂**")
-        co_1, co_2, co_3, co_4 = st.columns(4)
-        co_1.metric("CO₂ celkem", f"{res['CO₂ Celkem [tCO₂]'].sum():,.1f} t",
-                    help="Celkové emise za sledované období")
-        co_2.metric("CO₂ KGJ", f"{res['CO₂ KGJ [tCO₂]'].sum():,.1f} t",
-                    help="Emise ze spalování plynu v KGJ")
-        co_3.metric("CO₂ Kotel", f"{res['CO₂ Kotel [tCO₂]'].sum():,.1f} t",
-                    help="Emise ze spalování plynu v kotli")
-        co_4.metric("CO₂ Síť (netto)", f"{res['CO₂ Síť [tCO₂]'].sum():,.1f} t",
-                    help="Emise z nákupu EE minus úspora za export EE do sítě")
-
-    # ────────────────────────────────────────────
-    # VŠECHNY OSTATNÍ GRAFY (původní obsah)
-    # ────────────────────────────────────────────
-    
-    st.subheader("🔥 Pokrytí tepelné poptávky")
-    fig = go.Figure()
-    for col, name, color in [
-        ('KGJ [MW_th]',          'KGJ',         '#27ae60'),
-        ('Kotel [MW_th]',        'Kotel',        '#3498db'),
-        ('Elektrokotel [MW_th]', 'Elektrokotel', '#9b59b6'),
-        ('Import tepla [MW_th]', 'Import tepla', '#e74c3c'),
-        ('TES netto [MW_th]',    'TES netto',    '#f39c12'),
-    ]:
-        fig.add_trace(go.Scatter(x=res['Čas'], y=res[col].clip(lower=0),
-            name=name, stackgroup='teplo', fillcolor=color, line_width=0))
-    fig.add_trace(go.Scatter(x=res['Čas'], y=res['Shortfall [MW]'],
-        name='Nedodáno ⚠️', stackgroup='teplo', fillcolor='rgba(200,0,0,0.45)', line_width=0))
-    fig.add_trace(go.Scatter(x=res['Čas'], y=res['Poptávka tepla [MW]']*p['h_cover'],
-        name='Cílová poptávka', mode='lines', line=dict(color='black', width=2, dash='dot')))
-    fig.update_layout(height=480, hovermode='x unified', title="Složení tepelné dodávky v čase")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("⚡ Bilance elektřiny")
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        row_heights=[0.5, 0.5], subplot_titles=("Zdroje EE [MW]", "Spotřeba / export EE [MW]"))
-    for col, name, color in [
-        ('EE z KGJ [MW]',      'KGJ',       '#2ecc71'),
-        ('EE z FVE [MW]',      'FVE',        '#f1c40f'),
-        ('EE import [MW]',     'Import EE',  '#2980b9'),
-        ('BESS vybíjení [MW]', 'BESS výdej', '#8e44ad'),
-    ]:
-        fig.add_trace(go.Scatter(x=res['Čas'], y=res[col], name=name,
-            stackgroup='vyroba', fillcolor=color), row=1, col=1)
-    for col, name, color in [
-        ('EE do EK [MW]',      'EK',            '#e74c3c'),
-        ('BESS nabíjení [MW]', 'BESS nabíjení', '#34495e'),
-        ('EE export [MW]',     'Export EE',     '#16a085'),
-    ]:
-        fig.add_trace(go.Scatter(x=res['Čas'], y=-res[col], name=name,
-            stackgroup='spotreba', fillcolor=color), row=2, col=1)
-    fig.update_layout(height=640, hovermode='x unified')
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("🔋 Stavy akumulátorů")
-    fig = make_subplots(rows=1, cols=2, subplot_titles=("TES SOC [MWh]", "BESS SOC [MWh]"))
-    fig.add_trace(go.Scatter(x=res['Čas'], y=res['TES SOC [MWh]'],
-        name='TES', line_color='#e67e22'), row=1, col=1)
-    if use_tes:
-        fig.add_hline(y=p['tes_cap'], line_dash="dot", line_color='#e67e22',
-            annotation_text="Max", row=1, col=1)
-    fig.add_trace(go.Scatter(x=res['Čas'], y=res['BESS SOC [MWh]'],
-        name='BESS', line_color='#3498db'), row=1, col=2)
-    if use_bess:
-        fig.add_hline(y=p['bess_cap'], line_dash="dot", line_color='#3498db',
-            annotation_text="Max", row=1, col=2)
-    fig.update_layout(height=380)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("💰 Kumulativní zisk")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=res['Čas'], y=res['Kumulativní zisk [€]'],
-        fill='tozeroy', fillcolor='rgba(39,174,96,0.2)', line_color='#27ae60', name='Kum. zisk'))
-    fig.update_layout(height=360, title="Průběh kumulativního zisku v čase")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Monthly Analysis
-    st.subheader("📅 Měsíční analýza")
-    monthly = res.groupby('Měsíc').agg(
-        teplo_kgj   =('KGJ [MW_th]',          'sum'),
-        teplo_kotel =('Kotel [MW_th]',         'sum'),
-        teplo_ek    =('Elektrokotel [MW_th]',  'sum'),
-        teplo_imp   =('Import tepla [MW_th]',  'sum'),
-        ee_export   =('EE export [MW]',        'sum'),
-        ee_import   =('EE import [MW]',        'sum'),
-        shortfall   =('Shortfall [MW]',        'sum'),
-        kgj_h       =('KGJ on',                'sum'),
-        kotel_h     =('Kotel on',              'sum'),
-        imp_h       =('Import tepla on',       'sum'),
-        rev_teplo   =('Rev teplo [€]',         'sum'),
-        rev_ee      =('Rev EE [€]',            'sum'),
-        c_gas_kgj   =('Nákl plyn KGJ [€]',    'sum'),
-        c_gas_kotel =('Nákl plyn kotel [€]',  'sum'),
-        c_ee_imp    =('Nákl EE import [€]',   'sum'),
-        c_ee_ek     =('Nákl EE EK [€]',       'sum'),
-        c_imp_tepla =('Nákl imp tepla [€]',   'sum'),
-        c_starty    =('Nákl starty [€]',       'sum'),
-        c_bess      =('Nákl BESS [€]',        'sum'),
-        c_pen       =('Nákl penalizace [€]',  'sum'),
-        zisk        =('Hodinový zisk [€]',     'sum'),
-    ).reset_index()
-    monthly['Měsíc_str'] = monthly['Měsíc'].map(MONTH_NAMES)
-    
-    st.dataframe(monthly[['Měsíc_str', 'teplo_kgj', 'ee_export', 'zisk', 'kgj_h']], 
-                 use_container_width=True, hide_index=True)
-
-    # Heatmapa zisku
-    st.subheader("🗓️ Heatmapa hodinového zisku")
-    res_hm = res.copy()
-    res_hm['Den']    = pd.to_datetime(res_hm['Čas']).dt.dayofyear
-    res_hm['Hodina'] = pd.to_datetime(res_hm['Čas']).dt.hour
-    pivot = res_hm.pivot_table(index='Hodina', columns='Den',
-        values='Hodinový zisk [€]', aggfunc='sum')
-    fig = go.Figure(go.Heatmap(z=pivot.values, x=pivot.columns, y=pivot.index,
-        colorscale='RdYlGn', colorbar=dict(title='€/hod'), zmid=0))
-    fig.update_layout(height=420, xaxis_title="Den v roce", yaxis_title="Hodina dne")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Excel Export
-    st.divider()
-    st.subheader("⬇️ Export výsledků")
-
-    def to_excel(df_res, df_input, params, monthly_df, scenario_comparison_df=None):
-        buf = io.BytesIO()
-        skip_cols = {'Měsíc', 'Hodina dne', 'KGJ on', 'Kotel on', 'Import tepla on'}
-        df_exp = df_res[[c for c in df_res.columns if c not in skip_cols]].copy()
-
-        with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-            df_exp.to_excel(writer, index=False, sheet_name='Hodinová data')
-            monthly_df.to_excel(writer, index=False, sheet_name='Měsíční souhrn')
-            df_input.to_excel(writer, index=False, sheet_name='Vstupní data')
-
-            # List s parametry konfigurace
-            params_df = pd.DataFrame([
-                {'Parametr': k, 'Hodnota': str(v)}
-                for k, v in params.items()
-                if not isinstance(v, (dict, list))
-            ])
-            params_df.to_excel(writer, index=False, sheet_name='Parametry')
-
-            # List se scénáři (pokud existuje)
-            if scenario_comparison_df is not None:
-                scenario_comparison_df.to_excel(writer, index=False, sheet_name='Scénáře')
-
-            # xlsxwriter formátování – tučné hlavičky, šířky sloupců, číselný formát
-            workbook  = writer.book
-            hdr_fmt   = workbook.add_format({
-                'bold': True, 'bg_color': '#D9E1F2',
-                'border': 1, 'text_wrap': False
-            })
-            num_fmt   = workbook.add_format({'num_format': '#,##0.00'})
-            txt_fmt   = workbook.add_format({'num_format': '@'})
-            for sheet_name, df_sheet in [
-                ('Hodinová data',  df_exp),
-                ('Měsíční souhrn', monthly_df),
-                ('Vstupní data',   df_input),
-                ('Parametry',      params_df),
-            ] + ([('Scénáře', scenario_comparison_df)] if scenario_comparison_df is not None else []):
-                ws = writer.sheets[sheet_name]
-                for col_idx, col_name in enumerate(df_sheet.columns):
-                    col_data = df_sheet.iloc[:, col_idx]
-                    is_num = pd.api.types.is_numeric_dtype(col_data)
-                    col_fmt = num_fmt if is_num else txt_fmt
-                    ws.set_column(col_idx, col_idx, 18, col_fmt)
-                    ws.write(0, col_idx, col_name, hdr_fmt)
-
-        return buf.getvalue()
-
-    scenario_comp_df = create_scenario_comparison_df(st.session_state.scenario_results) \
-        if st.session_state.scenario_results else None
-    xlsx = to_excel(res.round(4), df, p, monthly, scenario_comp_df)
-    st.download_button(
-        label="📥 Stáhnout výsledky (Excel .xlsx)",
-        data=xlsx,
-        file_name="kgj_optimalizace.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    # ─────────────────────────────────────────────
-    # CITLIVOSTNÍ ANALÝZA
-    # ─────────────────────────────────────────────
     st.divider()
     st.subheader("📊 Citlivostní analýza")
     st.markdown("Zobrazí, jak se změní zisk při změně tržní ceny plynu nebo elektřiny.")
@@ -2190,12 +1840,7 @@ if st.session_state.results is not None and st.session_state.scenario_results is
     with col_sa3:
         sa_steps = st.selectbox("Počet kroků:", [3, 5, 7, 9], index=1, key="sa_steps")
 
-    # Výběr profilu – zahrnuje single result i scénáře
-    available_profiles = ['free']
-    if st.session_state.scenario_results:
-        available_profiles = list(st.session_state.scenario_results.keys())
-    elif st.session_state.results:
-        available_profiles = ['free']
+    available_profiles = list(st.session_state.scenario_results.keys())
     sa_profile = st.selectbox(
         "Profil pro analýzu:",
         options=available_profiles,
@@ -2206,7 +1851,7 @@ if st.session_state.results is not None and st.session_state.scenario_results is
     if st.button("📊 Spustit citlivostní analýzu", key="btn_sensitivity"):
         with st.spinner("⏳ Probíhá citlivostní analýza …"):
             sa_df = run_sensitivity_analysis(
-                df=df, params=p, uses=uses,
+                df=_sa_df_main, params=p, uses=_sa_uses,
                 profile_type=sa_profile,
                 gas_range=sa_gas_range, ee_range=sa_ee_range, steps=sa_steps,
                 custom_hours=custom_hours if sa_profile == 'custom' else None
@@ -2256,7 +1901,6 @@ if st.session_state.results is not None and st.session_state.scenario_results is
             use_container_width=True, hide_index=True
         )
 
-        # Download citlivostní analýzy
         xlsx_sa = to_excel_sensitivity(
             sa_df=sa_df,
             profile_name=sa_profile,

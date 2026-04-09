@@ -238,8 +238,9 @@ def _safe_sheet(name: str) -> str:
     return re.sub(r'[/\\*?:\[\]]', '-', name)[:31]
 
 def _write_sheet(writer, df, sheet_name, hdr_fmt, num_fmt, txt_fmt):
-    df.to_excel(writer, index=False, sheet_name=_safe_sheet(sheet_name))
-    ws = writer.sheets[sheet_name]
+    safe = _safe_sheet(sheet_name)
+    df.to_excel(writer, index=False, sheet_name=safe)
+    ws = writer.sheets[safe]
     for col_idx, col_name in enumerate(df.columns):
         is_num = pd.api.types.is_numeric_dtype(df.iloc[:, col_idx])
         ws.set_column(col_idx, col_idx, 18, num_fmt if is_num else txt_fmt)

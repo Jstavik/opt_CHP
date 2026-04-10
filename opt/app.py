@@ -1053,19 +1053,24 @@ def run_scenario_analysis(df, params, uses, profiles_to_run, custom_hours=None,
     
     for idx, profile in enumerate(profiles_to_run):
         status_text.write(f"⏳ Optimalizuji profil: **{profile.upper()}**...")
-        
+
         profile_custom_hours = custom_hours if profile == 'custom' else None
-        
-        result = run_optimization_with_profile(
-            df=df,
-            params=params,
-            uses=uses,
-            profile_type=profile,
-            custom_hours=profile_custom_hours,
-            max_starts_per_month=max_starts_per_month,
-            period_mask=period_mask
-        )
-        
+
+        try:
+            result = run_optimization_with_profile(
+                df=df,
+                params=params,
+                uses=uses,
+                profile_type=profile,
+                custom_hours=profile_custom_hours,
+                max_starts_per_month=max_starts_per_month,
+                period_mask=period_mask,
+                time_limit=60,
+            )
+        except Exception as exc:
+            st.error(f"❌ Profil {profile.upper()} – výjimka: {exc}")
+            result = None
+
         if result is not None:
             smoothness = calculate_smoothness_metrics(result['res'])
             scenarios[profile] = {
@@ -1104,13 +1109,18 @@ def run_monthly_profile_analysis(df, params, uses, profiles_to_run,
         results[month] = {}
         for profile in profiles_to_run:
             status.write(f"⏳ Měsíc **{MONTH_NAMES.get(month, month)}**, profil **{profile.upper()}**...")
-            r = run_optimization_with_profile(
-                df=df, params=params, uses=uses,
-                profile_type=profile,
-                custom_hours=custom_hours if profile == 'custom' else None,
-                max_starts_per_month=max_starts_per_month,
-                period_mask=mask
-            )
+            try:
+                r = run_optimization_with_profile(
+                    df=df, params=params, uses=uses,
+                    profile_type=profile,
+                    custom_hours=custom_hours if profile == 'custom' else None,
+                    max_starts_per_month=max_starts_per_month,
+                    period_mask=mask,
+                    time_limit=60,
+                )
+            except Exception as exc:
+                st.warning(f"⚠️ {MONTH_NAMES.get(month, month)} / {profile.upper()}: výjimka: {exc}")
+                r = None
             if r is not None:
                 n_hours = int(mask.sum())
                 results[month][profile] = {

@@ -238,8 +238,9 @@ def _safe_sheet(name: str) -> str:
     return re.sub(r'[/\\*?:\[\]]', '-', name)[:31]
 
 def _write_sheet(writer, df, sheet_name, hdr_fmt, num_fmt, txt_fmt):
-    df.to_excel(writer, index=False, sheet_name=_safe_sheet(sheet_name))
-    ws = writer.sheets[sheet_name]
+    safe = _safe_sheet(sheet_name)
+    df.to_excel(writer, index=False, sheet_name=safe)
+    ws = writer.sheets[safe]
     for col_idx, col_name in enumerate(df.columns):
         is_num = pd.api.types.is_numeric_dtype(df.iloc[:, col_idx])
         ws.set_column(col_idx, col_idx, 18, num_fmt if is_num else txt_fmt)
@@ -1052,19 +1053,24 @@ def run_scenario_analysis(df, params, uses, profiles_to_run, custom_hours=None,
     
     for idx, profile in enumerate(profiles_to_run):
         status_text.write(f"⏳ Optimalizuji profil: **{profile.upper()}**...")
-        
+
         profile_custom_hours = custom_hours if profile == 'custom' else None
-        
-        result = run_optimization_with_profile(
-            df=df,
-            params=params,
-            uses=uses,
-            profile_type=profile,
-            custom_hours=profile_custom_hours,
-            max_starts_per_month=max_starts_per_month,
-            period_mask=period_mask
-        )
-        
+
+        try:
+            result = run_optimization_with_profile(
+                df=df,
+                params=params,
+                uses=uses,
+                profile_type=profile,
+                custom_hours=profile_custom_hours,
+                max_starts_per_month=max_starts_per_month,
+                period_mask=period_mask,
+                time_limit=60,
+            )
+        except Exception as exc:
+            st.error(f"❌ Profil {profile.upper()} – výjimka: {exc}")
+            result = None
+
         if result is not None:
             smoothness = calculate_smoothness_metrics(result['res'])
             scenarios[profile] = {
@@ -1103,13 +1109,18 @@ def run_monthly_profile_analysis(df, params, uses, profiles_to_run,
         results[month] = {}
         for profile in profiles_to_run:
             status.write(f"⏳ Měsíc **{MONTH_NAMES.get(month, month)}**, profil **{profile.upper()}**...")
-            r = run_optimization_with_profile(
-                df=df, params=params, uses=uses,
-                profile_type=profile,
-                custom_hours=custom_hours if profile == 'custom' else None,
-                max_starts_per_month=max_starts_per_month,
-                period_mask=mask
-            )
+            try:
+                r = run_optimization_with_profile(
+                    df=df, params=params, uses=uses,
+                    profile_type=profile,
+                    custom_hours=custom_hours if profile == 'custom' else None,
+                    max_starts_per_month=max_starts_per_month,
+                    period_mask=mask,
+                    time_limit=60,
+                )
+            except Exception as exc:
+                st.warning(f"⚠️ {MONTH_NAMES.get(month, month)} / {profile.upper()}: výjimka: {exc}")
+                r = None
             if r is not None:
                 n_hours = int(mask.sum())
                 results[month][profile] = {

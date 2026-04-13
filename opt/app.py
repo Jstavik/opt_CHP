@@ -1694,7 +1694,7 @@ if st.session_state.scenario_results is not None:
                 margin=dict(l=10, r=10, t=50, b=10),
             )
             with wf_cols[col_idx]:
-                st.plotly_chart(fig_wf, use_container_width=True)
+                st.plotly_chart(fig_wf, use_container_width=True, key=f"wf_{row['Profil'].lower()}")
 
     # ── Detailní view – záložka per profil ──────────────────────────
     st.divider()
@@ -1783,7 +1783,7 @@ if st.session_state.scenario_results is not None:
                 fig.add_trace(go.Scatter(x=res['Čas'], y=res['Poptávka tepla [MW]']*p['h_cover'],
                     name='Cílová poptávka', mode='lines', line=dict(color='black', width=2, dash='dot')))
                 fig.update_layout(height=450, hovermode='x unified')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"teplo_{pr}")
 
                 st.markdown("#### ⚡ Bilance Elektřiny")
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
@@ -1806,7 +1806,7 @@ if st.session_state.scenario_results is not None:
                         fig.add_trace(go.Scatter(x=res['Čas'], y=-res[col], name=name,
                             stackgroup='spotreba', fillcolor=color), row=2, col=1)
                 fig.update_layout(height=600, hovermode='x unified')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"ee_{pr}")
 
                 st.markdown("#### 💰 Kumulativní Zisk v Čase")
                 _pr_color = PROFILE_COLORS.get(pr, '#27ae60')
@@ -1817,7 +1817,7 @@ if st.session_state.scenario_results is not None:
                     fill='tozeroy', fillcolor=f'rgba({_pr_r},{_pr_g},{_pr_b},0.2)',
                     line_color=_pr_color, name='Kum. zisk'))
                 fig.update_layout(height=350, hovermode='x unified')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"kum_{pr}")
 
     # ── Download scénářů ──
     st.divider()
